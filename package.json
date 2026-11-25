@@ -1,0 +1,14 @@
+{
+  "name": "csay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Csay 语言编译器 —— 中文关键字、编译为原生可执行文件",
+  "scripts": {
+    "tokens": "node src/cli.ts",
+    "bootstrap": "node tools/自举.mjs"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}

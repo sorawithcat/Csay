@@ -1,0 +1,6 @@
+{
+  "name": "Csay",
+  "entry": "examples/多文件/主.csay",
+  "output": "Csay",
+  "version": "0.1.0"
+}

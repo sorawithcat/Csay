@@ -1,0 +1,34 @@
+{
+  "name": "csay",
+  "displayName": "Csay",
+  "description": "Csay 中文编程语言的语法高亮与代码片段",
+  "version": "1.0.0",
+  "publisher": "csay",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "csay",
+        "aliases": ["Csay", "csay"],
+        "extensions": [".csay"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "csay",
+        "scopeName": "source.csay",
+        "path": "./syntaxes/csay.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "csay",
+        "path": "./snippets/csay.json"
+      }
+    ]
+  }
+}

@@ -1,0 +1,147 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Csay",
+  "scopeName": "source.csay",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#declaration" },
+    { "include": "#type" },
+    { "include": "#modifier" },
+    { "include": "#control" },
+    { "include": "#exception" },
+    { "include": "#import" },
+    { "include": "#literal" },
+    { "include": "#self" },
+    { "include": "#accessor" },
+    { "include": "#number" },
+    { "include": "#funcdecl" },
+    { "include": "#method" },
+    { "include": "#funccall" }
+  ],
+  "repository": {
+    "comment": {
+      "match": "//.*$",
+      "name": "comment.line.double-slash.csay"
+    },
+
+    "string": {
+      "patterns": [
+        {
+          "begin": "\\$\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.csay" } },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.csay" } },
+          "name": "string.interpolated.csay",
+          "patterns": [
+            { "include": "#interpolation" },
+            { "include": "#string-escape" }
+          ]
+        },
+        {
+          "begin": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.csay" } },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.csay" } },
+          "name": "string.quoted.double.csay",
+          "patterns": [
+            { "include": "#string-escape" }
+          ]
+        }
+      ]
+    },
+
+    "interpolation": {
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.csay" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.csay" } },
+      "name": "meta.interpolation.csay",
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#string" },
+        { "include": "#type" },
+        { "include": "#control" },
+        { "include": "#literal" },
+        { "include": "#number" },
+        { "include": "#method" },
+        { "include": "#funccall" }
+      ]
+    },
+
+    "string-escape": {
+      "match": "\\\\(n|t|r|\"|\\\\|\\{|\\})",
+      "name": "constant.character.escape.csay"
+    },
+
+    "declaration": {
+      "match": "(类|结构|接口|枚举|空间)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "storage.type.declaration.csay"
+    },
+
+    "type": {
+      "match": "(整数|小数|文本|真假|字节|任意|列表|表|无)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "storage.type.csay"
+    },
+
+    "modifier": {
+      "match": "(公开|私有|保护|内部|静态|只读|抽象|虚拟|覆盖|常)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "storage.modifier.csay"
+    },
+
+    "control": {
+      "match": "(否则若|否则|若|择|情形|默认|对于|遍历|只要|做|在|返回|跳出|跳过|区域)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "keyword.control.csay"
+    },
+
+    "exception": {
+      "match": "(试|捕获|最终|抛出)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "keyword.control.exception.csay"
+    },
+
+    "import": {
+      "match": "(引)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "keyword.control.import.csay"
+    },
+
+    "literal": {
+      "match": "(新)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "keyword.operator.new.csay"
+    },
+
+    "self": {
+      "match": "(自|基)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "variable.language.csay"
+    },
+
+    "accessor": {
+      "match": "(取|写)(?![\\u4e00-\\u9fa5A-Za-z0-9_])",
+      "name": "keyword.other.accessor.csay"
+    },
+
+    "number": {
+      "match": "\\b\\d+(\\.\\d+)?\\b",
+      "name": "constant.numeric.csay"
+    },
+
+    "funcdecl": {
+      "match": "([\\u4e00-\\u9fa5A-Za-z_][\\u4e00-\\u9fa5A-Za-z0-9_]*)(\\s*)(?=\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.csay" }
+      }
+    },
+
+    "method": {
+      "match": "(\\.)([\\u4e00-\\u9fa5A-Za-z_][\\u4e00-\\u9fa5A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.accessor.csay" },
+        "2": { "name": "entity.name.function.method.csay" }
+      }
+    },
+
+    "funccall": {
+      "match": "([\\u4e00-\\u9fa5A-Za-z_][\\u4e00-\\u9fa5A-Za-z0-9_]*)(?=\\()",
+      "name": "entity.name.function.call.csay"
+    }
+  }
+}
