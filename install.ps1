@@ -35,8 +35,9 @@ foreach ($rel in $required) {
 New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
 
 # 复制编译器、文档与工具。node_modules 不需要，项目没有运行时依赖。
-foreach ($item in @('src', 'tools', 'docs', 'editors', 'selfhost', 'examples', 'tests')) {
+foreach ($item in @('src', 'tools', 'docs', 'selfhost', 'examples', 'tests')) {
     $from = Join-Path $Source $item
+    if (-not (Test-Path -LiteralPath $from)) { continue }
     $to = Join-Path $Prefix $item
     if (Test-Path -LiteralPath $to) { Remove-Item -LiteralPath $to -Recurse -Force }
     Copy-Item -LiteralPath $from -Destination $to -Recurse -Force
@@ -93,6 +94,7 @@ if ($nodeExe -like "$Prefix*") { $nodeCommand = '"%~dp0..\node\node.exe"' }
 $launcherText = @"
 @echo off
 setlocal
+chcp 65001 >nul
 $nodeCommand $nodeFlags "%~dp0..\src\cli.ts" %*
 "@
 Set-Content -LiteralPath $launcher -Value $launcherText -Encoding ASCII
@@ -100,6 +102,7 @@ $editorLauncher = Join-Path $bin 'csay-editor.cmd'
 $editorText = @"
 @echo off
 setlocal
+chcp 65001 >nul
 $nodeCommand $nodeFlags "%~dp0..\tools\editor.mjs" %*
 "@
 Set-Content -LiteralPath $editorLauncher -Value $editorText -Encoding ASCII
@@ -151,5 +154,5 @@ Write-Host ''
 Write-Step '安装完成。'
 Write-Host "  csay 你的程序.csay       编译并运行"
 Write-Host "  csay-editor              打开编辑器"
-Write-Host "  文档：$Prefix\docs\教程"
+Write-Host "  文档：$Prefix\docs\手册"
 Write-Host "  如需卸载：运行安装包中的 卸载Csay.bat"

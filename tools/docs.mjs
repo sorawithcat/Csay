@@ -1,4 +1,4 @@
-// Csay 教程页：把 docs/教程/*.md 渲染成带侧栏、章节编号和可编辑示例的文档。
+// Csay 文档页：把 docs/手册/*.md 渲染成带分类、编号和可编辑示例的文档。
 // 只处理本站用到的 Markdown 子集，不引第三方依赖。
 
 import { readFileSync, readdirSync } from 'node:fs'
@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
-const TUTORIAL_DIR = join(ROOT, 'docs', '教程')
+const DOCS_DIR = join(ROOT, 'docs', '手册')
 const REFERENCE_FILES = ['语言规范.md', 'EBNF与词法-v1.md', '未来计划.md']
 const CSS_PATH = join(ROOT, 'tools', 'docs.css')
 const JS_PATH = join(ROOT, 'tools', 'docs.js')
@@ -256,15 +256,15 @@ function renderMarkdown(source, chapterNo, resolveHref, numberHeadings = true) {
 
 function parseDoc(path, groupFallback, kind) {
   const raw = readFileSync(path, 'utf8')
-  const groupMatch = raw.match(/^<!--\s*分组[:：]\s*(.*?)\s*-->/m)
+  const groupMatch = raw.match(/^<!--\s*(?:分类|分组)[:：]\s*(.*?)\s*-->/m)
   const titleMatch = raw.match(/^#\s+(.+)$/m)
   const body = raw
-    .replace(/^<!--\s*分组[:：].*?-->\s*/, '')
+    .replace(/^<!--\s*(?:分类|分组)[:：].*?-->\s*/, '')
     .replace(/^#\s+.*$/m, '')
     .replace(/^\s*\n/, '')
   const file = path.split(/[\\/]/).pop()
   return {
-    id: kind === 'tutorial' ? file.replace(/^\d+[-_]/, '').replace(/\.md$/, '') : file.replace(/\.md$/, ''),
+    id: kind === 'tutorial' ? file.replace(/^\d+(?:\.\d+)?[-_]/, '').replace(/\.md$/, '') : file.replace(/\.md$/, ''),
     file,
     title: (titleMatch ? titleMatch[1] : file).trim(),
     group: (groupMatch ? groupMatch[1] : groupFallback).trim(),
@@ -276,17 +276,24 @@ function parseDoc(path, groupFallback, kind) {
 function loadChapters() {
   let files = []
   try {
-    files = readdirSync(TUTORIAL_DIR).filter((f) => f.endsWith('.md')).sort()
+    files = readdirSync(DOCS_DIR).filter((f) => f.endsWith('.md')).sort()
   } catch {
     return []
   }
-  const docs = files.map((file) => parseDoc(join(TUTORIAL_DIR, file), '教程', 'tutorial'))
+  const docs = files.map((file) => parseDoc(join(DOCS_DIR, file), '其他', 'tutorial'))
   for (const file of REFERENCE_FILES) {
     const path = join(ROOT, 'docs', file)
     try {
       docs.push(parseDoc(path, '参考', 'reference'))
     } catch {}
   }
+
+  const categories = ['概述', '语言', '类型', '标准库', '工具', '参考', '示例', '更新日志']
+  const rank = (doc) => {
+    const i = categories.indexOf(doc.group)
+    return i < 0 ? categories.length : i
+  }
+  docs.sort((a, b) => rank(a) - rank(b) || a.file.localeCompare(b.file, 'zh'))
 
   const byFile = new Map()
   for (const doc of docs) byFile.set(doc.file, doc)
@@ -299,10 +306,9 @@ function loadChapters() {
     return '/docs/' + encodeURIComponent(target.id) + (hash ? '#' + hash : '')
   }
 
-  let no = 0
+  const tutorialOrder = new Map(docs.filter((doc) => doc.kind === 'tutorial').map((doc, i) => [doc, i + 1]))
   return docs.map((doc) => {
-    if (doc.kind === 'tutorial') no++
-    const number = doc.kind === 'tutorial' ? no : ''
+    const number = doc.kind === 'tutorial' ? String(tutorialOrder.get(doc)) : ''
     const rendered = renderMarkdown(doc.body, number, resolveHref, doc.kind === 'tutorial')
     return { ...doc, number, html: rendered.html, sections: rendered.sections }
   })
@@ -320,9 +326,9 @@ function sectionLink(section) {
 export function renderDocsPage(chapterId) {
   const chapters = loadChapters()
   if (!chapters.length) {
-    return '<!doctype html><meta charset="utf-8"><title>Csay 教程</title>' +
-      '<body style="font-family:sans-serif;padding:40px"><h1>教程还没有内容</h1>' +
-      '<p>请在 <code>docs/教程/</code> 下添加 Markdown 文件。</p></body>'
+    return '<!doctype html><meta charset="utf-8"><title>Csay 文档</title>' +
+      '<body style="font-family:sans-serif;padding:40px"><h1>文档还没有内容</h1>' +
+      '<p>请在 <code>docs/手册/</code> 下添加 Markdown 文件。</p></body>'
   }
 
   let index = 0
@@ -336,7 +342,10 @@ export function renderDocsPage(chapterId) {
   const docLabel = (c) => c.number ? c.number + '. ' + c.title : c.title
 
   const side = chapters.map((c, i) => {
-    let html = '<a class="side-link' + (i === index ? ' on' : '') + '" href="' + chapterHref(c) + '">' +
+    const searchText = escapeHtml(
+      c.title + ' ' + c.sections.map((s) => s.title).join(' ') + ' ' + c.body
+    )
+    let html = '<a class="side-link' + (i === index ? ' on' : '') + '" href="' + chapterHref(c) + '" data-search="' + searchText + '">' +
       (c.number ? '<span class="side-no">' + c.number + '.</span>' : '') + escapeHtml(c.title) + '</a>'
     if (i === index && c.sections.length) {
       html += '<div class="side-sections">' + c.sections.map(sectionLink).join('') + '</div>'
@@ -376,7 +385,7 @@ export function renderDocsPage(chapterId) {
     '</header>' +
     '<div class="layout">' +
     '<aside class="sidebar" id="sidebar"><div class="side-title">文档目录</div>' +
-    '<div class="side-search"><input id="doc-search" type="search" placeholder="搜索章节或小节…" autocomplete="off"></div>' + side + '</aside>' +
+    '<div class="side-search"><input id="doc-search" type="search" placeholder="搜索页面或小节…" autocomplete="off"></div>' + side + '</aside>' +
     '<div class="side-mask" id="side-mask"></div>' +
     '<main class="doc-main">' +
     '<div class="doc-crumb">Csay 文档 <span>/</span> ' + escapeHtml(chapter.group) + '</div>' +

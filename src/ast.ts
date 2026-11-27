@@ -25,6 +25,7 @@ export type StringSeg =
 export type Expr =
   | (Base & { kind: 'int'; text: string })
   | (Base & { kind: 'float'; text: string })
+  | (Base & { kind: 'char'; value: number })
   | (Base & { kind: 'string'; interpolated: boolean; segs: StringSeg[] })
   | (Base & { kind: 'bool'; value: boolean })
   | (Base & { kind: 'null' })
@@ -37,14 +38,17 @@ export type Expr =
   | (Base & { kind: 'postfix'; op: string; operand: Expr })
   | (Base & { kind: 'assign'; op: string; target: Expr; value: Expr })
   | (Base & { kind: 'cond'; cond: Expr; then: Expr; else: Expr })
-  | (Base & { kind: 'call'; callee: Expr; args: Expr[] })
-  | (Base & { kind: 'member'; target: Expr; name: string })
+  | (Base & { kind: 'call'; callee: Expr; args: Expr[]; overload?: number })
+  | (Base & { kind: 'named'; name: string; value: Expr })
+  | (Base & { kind: 'byref'; mode: 'ref' | 'out'; expr: Expr })
+  | (Base & { kind: 'member'; target: Expr; name: string; nullSafe?: boolean })
   | (Base & { kind: 'index'; target: Expr; index: Expr })
   | (Base & { kind: 'new'; type: TypeRef; args: Expr[] })
+  | (Base & { kind: 'cast'; type: TypeRef; expr: Expr })
   | (Base & { kind: 'array'; elems: Expr[] })
   | (Base & { kind: 'paren'; expr: Expr })
   /** 无捕获的 Lambda：参数类型必须显式写出 */
-  | (Base & { kind: 'lambda'; params: Param[]; body: Expr | Stmt })
+  | (Base & { kind: 'lambda'; params: Param[]; body: Expr | Stmt; retType?: string })
 
 // ---------------- 语句 ----------------
 
@@ -52,6 +56,7 @@ export interface Param {
   type: TypeRef
   name: string
   def: Expr | null
+  mode?: 'ref' | 'out'
 }
 
 export interface CaseClause {
@@ -66,6 +71,7 @@ export interface CatchClause {
   type: TypeRef
   name: string
   body: Stmt
+  filter?: Expr | null
 }
 
 export type Stmt =
@@ -99,9 +105,9 @@ export interface Accessor {
 
 export type Member =
   | (Base & { kind: 'field'; modifiers: Modifier[]; type: TypeRef; name: string; init: Expr | null })
-  | (Base & { kind: 'method'; modifiers: Modifier[]; ret: TypeRef; name: string; params: Param[]; body: Stmt | null })
-  | (Base & { kind: 'ctor'; modifiers: Modifier[]; name: string; params: Param[]; baseArgs: Expr[] | null; body: Stmt })
-  | (Base & { kind: 'prop'; modifiers: Modifier[]; type: TypeRef; name: string; accessors: Accessor[] })
+  | (Base & { kind: 'method'; modifiers: Modifier[]; ret: TypeRef; name: string; params: Param[]; body: Stmt | null; exprBody?: Expr | null })
+  | (Base & { kind: 'ctor'; modifiers: Modifier[]; name: string; params: Param[]; baseArgs: Expr[] | null; body: Stmt; exprBody?: Expr | null })
+  | (Base & { kind: 'prop'; modifiers: Modifier[]; type: TypeRef; name: string; accessors: Accessor[]; exprBody?: Expr | null })
   | (Base & { kind: 'ifaceMethod'; ret: TypeRef; name: string; params: Param[] })
   | (Base & { kind: 'ifaceProp'; type: TypeRef; name: string; hasGet: boolean; hasSet: boolean })
 
@@ -115,8 +121,8 @@ export interface EnumItem {
 }
 
 export type Decl =
-  | (Base & { kind: 'class' | 'struct'; modifiers: Modifier[]; name: string; typeParams?: string[]; bases: TypeRef[]; members: Member[] })
-  | (Base & { kind: 'interface'; modifiers: Modifier[]; name: string; typeParams?: string[]; bases: TypeRef[]; members: Member[] })
+  | (Base & { kind: 'class' | 'struct'; modifiers: Modifier[]; name: string; typeParams?: string[]; typeConstraints?: Record<string, TypeRef[]>; bases: TypeRef[]; members: Member[] })
+  | (Base & { kind: 'interface'; modifiers: Modifier[]; name: string; typeParams?: string[]; typeConstraints?: Record<string, TypeRef[]>; bases: TypeRef[]; members: Member[] })
   | (Base & { kind: 'enum'; modifiers: Modifier[]; name: string; items: EnumItem[] })
   | (Base & { kind: 'delegate'; modifiers: Modifier[]; name: string; params: Param[]; ret: TypeRef })
   | (Base & { kind: 'namespace'; name: string; decls: Decl[] })

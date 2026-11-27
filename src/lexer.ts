@@ -80,6 +80,7 @@ export class Lexer {
     if (ch === '“') return this.readString(line, col, true, '”')
 
     if (ch === '"') return this.readString(line, col, true)
+    if (ch === "'") return this.readChar(line, col)
     if (ch === '$' && this.peek(1) === '"') {
       this.advance() // 吃掉 $
       return this.readString(line, col, true)
@@ -209,6 +210,49 @@ export class Lexer {
     }
 
     return { kind: 'int', text, line, col }
+  }
+
+  // ---- 字符 ----
+
+  private readChar(line: number, col: number): Token {
+    this.advance() // 开引号
+    let text = ''
+    if (this.pos >= this.src.length || this.peek() === '\n') {
+      this.error(line, col, '字符没有闭合', '字符字面量写成 \'甲\' 这样')
+      return { kind: 'char', text: '', line, col }
+    }
+    if (this.peek() === '\\') {
+      this.advance()
+      const esc = this.advance()
+      switch (esc) {
+        case 'n': text = '\n'; break
+        case 't': text = '\t'; break
+        case 'r': text = '\r'; break
+        case '0': text = '\0'; break
+        case "'": text = "'"; break
+        case '"': text = '"'; break
+        case '\\': text = '\\'; break
+        case 'u': {
+          let hex = ''
+          for (let i = 0; i < 4; i++) {
+            const c = this.peek()
+            if (!/[0-9a-fA-F]/.test(c)) break
+            hex += this.advance()
+          }
+          if (hex.length !== 4) this.error(this.line, this.col, '\\u 后面需要 4 位十六进制数')
+          else text = String.fromCharCode(parseInt(hex, 16))
+          break
+        }
+        default:
+          this.error(this.line, this.col - 2, `不认识转义「\\${esc}」`, '字符里可用 \\n \\t \\r \\0 \\\' \\\\ \\uXXXX')
+          text = esc
+      }
+    } else {
+      text = this.advance()
+    }
+    if (this.peek() === "'") this.advance()
+    else this.error(line, col, '字符字面量只能有一个字符')
+    return { kind: 'char', text, line, col }
   }
 
   // ---- 文本 ----

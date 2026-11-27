@@ -1,5 +1,4 @@
 /* 由 tools/导出运行时.mjs 生成，勿手改 */
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,12 +18,14 @@
 #endif
 
 typedef int64_t CsayInt;
+typedef float CsayFloat32;
 typedef double CsayFloat;
 typedef bool CsayBool;
 
 typedef struct { const char* p; int64_t n; } CsayStr;
+typedef struct { int64_t len; int64_t elem; } CsayArrayHead;
 
-typedef struct { CsayStr msg; CsayInt kind; } CsayError;
+typedef struct { CsayStr msg; CsayInt kind; CsayInt ok; } CsayError;
 
 #define CSAY_ERR_BASE 0
 #define CSAY_ERR_ARG 1
@@ -109,10 +110,166 @@ typedef struct CsayRegion {
 
 static CsayRegion* csay_region_top = NULL;
 
+/* 保守垃圾回收：只管理非区域分配；区域内的块仍由区域整块释放。 */
+typedef struct CsayGCBlock {
+    int64_t size;
+    int64_t mark;
+    struct CsayGCBlock* next;
+} CsayGCBlock;
+
+typedef struct {
+    void* p;
+    int64_t n;
+} CsayGCRoot;
+
+static CsayGCBlock* csay_gc_blocks = NULL;
+static CsayGCBlock** csay_gc_index = NULL;
+static int64_t csay_gc_index_count = 0;
+static int64_t csay_gc_block_count = 0;
+static int64_t csay_gc_bytes = 0;
+static int64_t csay_gc_threshold = 8 * 1024 * 1024;
+static char* csay_gc_stack_bottom = NULL;
+static int csay_gc_running = 0;
+static CsayGCRoot* csay_gc_roots = NULL;
+static int64_t csay_gc_root_count = 0;
+static int64_t csay_gc_root_cap = 0;
+
+static void csay_gc_add_root(void* p, int64_t n) {
+    if (csay_gc_root_count == csay_gc_root_cap) {
+        int64_t cap = csay_gc_root_cap == 0 ? 64 : csay_gc_root_cap * 2;
+        CsayGCRoot* next = (CsayGCRoot*)realloc(csay_gc_roots, (size_t)(cap * (int64_t)sizeof(CsayGCRoot)));
+        if (next == NULL) return;
+        csay_gc_roots = next;
+        csay_gc_root_cap = cap;
+    }
+    csay_gc_roots[csay_gc_root_count].p = p;
+    csay_gc_roots[csay_gc_root_count].n = n;
+    csay_gc_root_count++;
+}
+
+static void csay_gc_init(void* bottom) {
+    csay_gc_stack_bottom = (char*)bottom;
+}
+
+static void csay_gc_mark_block(CsayGCBlock* b);
+
+static int csay_gc_cmp_block(const void* a, const void* b) {
+    char* da = (char*)(*(CsayGCBlock* const*)a + 1);
+    char* db = (char*)(*(CsayGCBlock* const*)b + 1);
+    return da < db ? -1 : (da > db ? 1 : 0);
+}
+
+static void csay_gc_mark_ptr(uintptr_t p) {
+    if (p == 0 || csay_gc_index_count == 0) return;
+    int64_t lo = 0, hi = csay_gc_index_count;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        CsayGCBlock* b = csay_gc_index[mid];
+        char* data = (char*)(b + 1);
+        if (p < (uintptr_t)data) {
+            hi = mid;
+        } else if (p >= (uintptr_t)(data + b->size)) {
+            lo = mid + 1;
+        } else {
+            csay_gc_mark_block(b);
+            return;
+        }
+    }
+}
+
+static void csay_gc_mark_block(CsayGCBlock* b) {
+    if (b->mark) return;
+    b->mark = 1;
+    char* data = (char*)(b + 1);
+    for (int64_t i = 0; i + 8 <= b->size; i += 8) {
+        uintptr_t v;
+        memcpy(&v, data + i, sizeof v);
+        csay_gc_mark_ptr(v);
+    }
+}
+
+static void csay_gc_mark_range(char* a, char* b) {
+    if (a > b) { char* t = a; a = b; b = t; }
+    uintptr_t start = ((uintptr_t)a + 7) & ~(uintptr_t)7;
+    for (char* q = (char*)start; q + 8 <= b; q += 8) {
+        uintptr_t v;
+        memcpy(&v, q, sizeof v);
+        csay_gc_mark_ptr(v);
+    }
+}
+
+static void csay_gc_collect(void) {
+    if (csay_gc_stack_bottom == NULL || csay_gc_running) return;
+    /* 区域活动期间，GC 块可能只被区域内存引用，暂不回收。 */
+    if (csay_region_top != NULL) return;
+    csay_gc_running = 1;
+
+    csay_gc_index = (CsayGCBlock**)realloc(csay_gc_index, (size_t)(csay_gc_block_count * (int64_t)sizeof(CsayGCBlock*)));
+    if (csay_gc_index == NULL) {
+        csay_gc_threshold = csay_gc_bytes * 2 + 4 * 1024 * 1024;
+        csay_gc_running = 0;
+        return;
+    }
+    int64_t index_count = 0;
+    for (CsayGCBlock* b = csay_gc_blocks; b != NULL; b = b->next) {
+        csay_gc_index[index_count++] = b;
+    }
+    csay_gc_index_count = index_count;
+    qsort(csay_gc_index, (size_t)index_count, sizeof(CsayGCBlock*), csay_gc_cmp_block);
+
+    for (int64_t i = 0; i < csay_gc_root_count; i++) {
+        char* p = (char*)csay_gc_roots[i].p;
+        csay_gc_mark_range(p, p + csay_gc_roots[i].n);
+    }
+
+    jmp_buf regs;
+    memset(&regs, 0, sizeof regs);
+    setjmp(regs);
+    csay_gc_mark_range((char*)&regs, (char*)&regs + (int64_t)sizeof regs);
+
+    char marker = 0;
+    char* here = (char*)&marker;
+    csay_gc_mark_range(here, csay_gc_stack_bottom);
+
+    CsayGCBlock** link = &csay_gc_blocks;
+    while (*link != NULL) {
+        CsayGCBlock* b = *link;
+        if (b->mark) {
+            b->mark = 0;
+            link = &b->next;
+        } else {
+            *link = b->next;
+            csay_gc_block_count--;
+            csay_gc_bytes -= b->size;
+            free(b);
+        }
+    }
+
+    csay_gc_index_count = 0;
+    csay_gc_threshold = csay_gc_bytes * 2 + 4 * 1024 * 1024;
+    csay_gc_running = 0;
+}
+
+static void* csay_gc_alloc(int64_t n) {
+    if (csay_gc_stack_bottom != NULL && !csay_gc_running &&
+        csay_gc_bytes + n > csay_gc_threshold) {
+        csay_gc_collect();
+    }
+    CsayGCBlock* b = (CsayGCBlock*)malloc((size_t)((int64_t)sizeof(CsayGCBlock) + n));
+    if (b == NULL) return NULL;
+    b->size = n;
+    b->mark = 0;
+    b->next = csay_gc_blocks;
+    csay_gc_blocks = b;
+    csay_gc_block_count++;
+    csay_gc_bytes += n;
+    return (void*)(b + 1);
+}
+
 static void* csay_alloc(int64_t n) {
     n = (n + 7) & ~7LL;
     if (n <= 0) n = 8;
-    if (csay_region_top == NULL) return malloc((size_t)n);
+    if (csay_region_top == NULL) return csay_gc_alloc(n);
     CsayChunk* c = csay_region_top->chunks;
     if (c == NULL || c->used + n > c->cap) {
         int64_t cap = 4096;
@@ -128,6 +285,61 @@ static void* csay_alloc(int64_t n) {
     char* p = c->mem + c->used;
     c->used += n;
     return (void*)p;
+}
+
+static void* csay_array_alloc(int64_t n, int64_t elem) {
+    CsayArrayHead* h = (CsayArrayHead*)csay_alloc((int64_t)sizeof(CsayArrayHead) + n * elem);
+    h->len = n;
+    h->elem = elem;
+    return (void*)(h + 1);
+}
+
+static int64_t csay_array_len(const void* p) {
+    if (p == NULL) return 0;
+    return ((const CsayArrayHead*)p)[-1].len;
+}
+
+static int64_t csay_array_elem(const void* p) {
+    if (p == NULL) return 0;
+    return ((const CsayArrayHead*)p)[-1].elem;
+}
+
+static void csay_array_append(void** pp, int64_t* len, int64_t elem, const void* v) {
+    int64_t n = *len;
+    void* p = csay_array_alloc(n + 1, elem);
+    if (n > 0) memcpy(p, *pp, (size_t)(n * elem));
+    memcpy((char*)p + n * elem, v, (size_t)elem);
+    *pp = p;
+    *len = n + 1;
+}
+
+static void csay_array_insert(void** pp, int64_t* len, int64_t elem, int64_t at, const void* v) {
+    int64_t n = *len;
+    if (at < 0) at = 0;
+    if (at > n) at = n;
+    void* p = csay_array_alloc(n + 1, elem);
+    if (at > 0) memcpy(p, *pp, (size_t)(at * elem));
+    memcpy((char*)p + at * elem, v, (size_t)elem);
+    if (at < n) memcpy((char*)p + (at + 1) * elem, (char*)*pp + at * elem, (size_t)((n - at) * elem));
+    *pp = p;
+    *len = n + 1;
+}
+
+static void csay_array_remove(void** pp, int64_t* len, int64_t elem, int64_t at) {
+    int64_t n = *len;
+    if (at < 0 || at >= n) return;
+    if (n == 1) {
+        *pp = NULL;
+        *len = 0;
+        return;
+    }
+    int64_t left = at;
+    int64_t right = n - at - 1;
+    void* p = csay_array_alloc(n - 1, elem);
+    if (left > 0) memcpy(p, *pp, (size_t)(left * elem));
+    if (right > 0) memcpy((char*)p + left * elem, (char*)*pp + (at + 1) * elem, (size_t)(right * elem));
+    *pp = p;
+    *len = n - 1;
 }
 
 static CsayRegion* csay_region_begin(void) {
@@ -154,6 +366,10 @@ static void csay_region_end(CsayRegion* r) {
 /* ---------------- 输出 ---------------- */
 
 static void csay_println_int(CsayInt v) { printf("%lld\n", (long long)v); }
+static void csay_println_float32(CsayFloat32 v) {
+    if (v == (CsayFloat32)(long long)v) printf("%lld\n", (long long)v);
+    else printf("%g\n", (double)v);
+}
 static void csay_println_float(CsayFloat v) {
     if (v == (CsayFloat)(long long)v) printf("%lld\n", (long long)v);
     else printf("%g\n", v);
@@ -178,6 +394,16 @@ static CsayStr csay_cat(CsayStr a, CsayStr b) {
 static CsayStr csay_str_of_int(CsayInt v) {
     char buf[32];
     int n = snprintf(buf, sizeof buf, "%lld", (long long)v);
+    char* p = (char*)csay_alloc(n + 1);
+    memcpy(p, buf, (size_t)n + 1);
+    return csay_str(p, n);
+}
+
+static CsayStr csay_str_of_float32(CsayFloat32 v) {
+    char buf[64];
+    int n;
+    if (v == (CsayFloat32)(long long)v) n = snprintf(buf, sizeof buf, "%lld", (long long)v);
+    else n = snprintf(buf, sizeof buf, "%.7g", (double)v);
     char* p = (char*)csay_alloc(n + 1);
     memcpy(p, buf, (size_t)n + 1);
     return csay_str(p, n);
@@ -268,13 +494,69 @@ static CsayStr csay_str_copy_c(const char* p) {
     return csay_str(q, n);
 }
 
+static CsayInt csay_parse_time_fail(void) {
+    csay_throw_error(csay_error(csay_lit("时间格式应为 YYYY-MM-DD[ HH:MM:SS][Z|±HH:MM]"), CSAY_ERR_FORMAT));
+    return 0;
+}
+
+static CsayInt csay_parse_time(CsayStr s) {
+    if (s.n <= 0 || s.n >= 64) return csay_parse_time_fail();
+    char buf[64];
+    memcpy(buf, s.p, (size_t)s.n);
+    buf[s.n] = 0;
+    int pos = 0;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    int offset = 0;
+    int got = sscanf(buf, "%d-%d-%d%n", &y, &mo, &d, &pos);
+    if (got != 3) return csay_parse_time_fail();
+    if (buf[pos] == 'T' || buf[pos] == ' ') {
+        int start = pos + 1;
+        int used = 0;
+        int gotTime = sscanf(buf + start, "%d:%d:%d%n", &h, &mi, &se, &used);
+        if (gotTime != 3) return csay_parse_time_fail();
+        pos = start + used;
+    }
+    while (buf[pos] == ' ') pos++;
+    if (buf[pos] == 'Z') {
+        pos++;
+    } else if (buf[pos] == '+' || buf[pos] == '-') {
+        int sign = buf[pos] == '-' ? -1 : 1;
+        int oh = 0, om = 0, used = 0;
+        pos++;
+        if (sscanf(buf + pos, "%d:%d%n", &oh, &om, &used) != 2) {
+            used = 0;
+            if (sscanf(buf + pos, "%2d%2d%n", &oh, &om, &used) != 2) return csay_parse_time_fail();
+        }
+        if (oh < 0 || oh > 23 || om < 0 || om > 59) return csay_parse_time_fail();
+        offset = sign * (oh * 3600 + om * 60);
+        pos += used;
+    }
+    if (buf[pos] != 0) return csay_parse_time_fail();
+    if (y < 1 || y > 9999 || mo < 1 || mo > 12 || d < 1) return csay_parse_time_fail();
+    int leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    int mdays[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (leap) mdays[1] = 29;
+    if (d > mdays[mo - 1]) return csay_parse_time_fail();
+    if (h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 59) return csay_parse_time_fail();
+    int yy = y - (mo <= 2 ? 1 : 0);
+    int era = (yy >= 0 ? yy : yy - 399) / 400;
+    int yoe = yy - era * 400;
+    int doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = (int64_t)era * 146097 + doe - 719468;
+    return days * 86400 + h * 3600 + mi * 60 + se - offset;
+}
+
 static CsayInt csay_timestamp(void) {
     return (CsayInt)time(NULL);
 }
 
-static CsayStr csay_format_time(CsayInt seconds, CsayStr format) {
-    time_t t = (time_t)seconds;
-    struct tm* tm = localtime(&t);
+static CsayStr csay_format_time_zone_fail(void) {
+    csay_throw_error(csay_error(csay_lit("时区格式应为 UTC、本地或 ±HH:MM"), CSAY_ERR_FORMAT));
+    return csay_lit("");
+}
+
+static CsayStr csay_format_tm(struct tm* tm, CsayStr format) {
     if (tm == NULL) return csay_lit("");
     char fmt[128];
     int64_t n = format.n < 127 ? format.n : 127;
@@ -283,6 +565,187 @@ static CsayStr csay_format_time(CsayInt seconds, CsayStr format) {
     char buf[512];
     size_t got = strftime(buf, sizeof buf, fmt, tm);
     return csay_str_copy_c(got > 0 ? buf : "");
+}
+
+static CsayStr csay_format_time(CsayInt seconds, CsayStr format) {
+    time_t t = (time_t)seconds;
+    struct tm* tm = localtime(&t);
+    return csay_format_tm(tm, format);
+}
+
+static CsayStr csay_localized_time(CsayInt seconds, CsayStr style) {
+    time_t t = (time_t)seconds;
+    struct tm* tm = localtime(&t);
+    if (tm == NULL) return csay_lit("");
+    static const char* weekdays[] = {
+        "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"
+    };
+    char buf[256];
+    if (csay_str_eq(style, csay_lit("短"))) {
+        strftime(buf, sizeof buf, "%Y/%m/%d", tm);
+    } else if (csay_str_eq(style, csay_lit("时间"))) {
+        strftime(buf, sizeof buf, "%H:%M:%S", tm);
+    } else if (csay_str_eq(style, csay_lit("星期"))) {
+        return csay_str_copy_c(weekdays[tm->tm_wday]);
+    } else if (csay_str_eq(style, csay_lit("英文"))) {
+        strftime(buf, sizeof buf, "%A, %B %d, %Y %H:%M:%S", tm);
+    } else {
+        snprintf(buf, sizeof buf, "%04d年%02d月%02d日 %s %02d:%02d:%02d",
+            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+            weekdays[tm->tm_wday], tm->tm_hour, tm->tm_min, tm->tm_sec);
+    }
+    return csay_str_copy_c(buf);
+}
+
+static int64_t csay_days_from_civil(int y, int m, int d) {
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static int csay_weekday_of(int y, int m, int d) {
+    int64_t days = csay_days_from_civil(y, m, d);
+    int wd = (int)((days + 4) % 7);
+    return wd < 0 ? wd + 7 : wd;
+}
+
+static int csay_nth_weekday(int y, int m, int wd, int n) {
+    int first = csay_weekday_of(y, m, 1);
+    return 1 + (wd - first + 7) % 7 + (n - 1) * 7;
+}
+
+static int csay_last_weekday(int y, int m, int wd) {
+    static const int dim[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    int d = dim[m - 1];
+    if (m == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) d = 29;
+    int last = csay_weekday_of(y, m, d);
+    return d - (last - wd + 7) % 7;
+}
+
+static int64_t csay_utc_seconds(int y, int m, int d, int h) {
+    return csay_days_from_civil(y, m, d) * 86400 + (int64_t)h * 3600;
+}
+
+static int csay_zone_dst(CsayStr zone, CsayInt seconds) {
+    time_t t = (time_t)seconds;
+    struct tm* tm = gmtime(&t);
+    int y = tm->tm_year + 1900;
+    if (csay_str_eq(zone, csay_lit("America/New_York")) || csay_str_eq(zone, csay_lit("America/Chicago")) || csay_str_eq(zone, csay_lit("America/Denver")) || csay_str_eq(zone, csay_lit("America/Los_Angeles")) || csay_str_eq(zone, csay_lit("America/Toronto")) || csay_str_eq(zone, csay_lit("America/Vancouver")) || csay_str_eq(zone, csay_lit("America/Anchorage")) || csay_str_eq(zone, csay_lit("America/Halifax")) || csay_str_eq(zone, csay_lit("America/St_Johns")) || csay_str_eq(zone, csay_lit("America/Detroit")) || csay_str_eq(zone, csay_lit("America/Edmonton")) || csay_str_eq(zone, csay_lit("America/Winnipeg")) || csay_str_eq(zone, csay_lit("America/Havana"))) {
+        int64_t start = csay_utc_seconds(y, 3, csay_nth_weekday(y, 3, 0, 2), 7);
+        int64_t end = csay_utc_seconds(y, 11, csay_nth_weekday(y, 11, 0, 1), 6);
+        return seconds >= start && seconds < end;
+    }
+    if (csay_str_eq(zone, csay_lit("Europe/London")) || csay_str_eq(zone, csay_lit("Europe/Paris")) || csay_str_eq(zone, csay_lit("Europe/Berlin")) || csay_str_eq(zone, csay_lit("Europe/Madrid")) || csay_str_eq(zone, csay_lit("Europe/Rome")) || csay_str_eq(zone, csay_lit("Europe/Amsterdam")) || csay_str_eq(zone, csay_lit("Europe/Brussels")) || csay_str_eq(zone, csay_lit("Europe/Vienna")) || csay_str_eq(zone, csay_lit("Europe/Stockholm")) || csay_str_eq(zone, csay_lit("Europe/Warsaw")) || csay_str_eq(zone, csay_lit("Europe/Lisbon")) || csay_str_eq(zone, csay_lit("Europe/Zurich")) || csay_str_eq(zone, csay_lit("Europe/Athens")) || csay_str_eq(zone, csay_lit("Europe/Helsinki")) || csay_str_eq(zone, csay_lit("Europe/Kyiv")) || csay_str_eq(zone, csay_lit("Europe/Bucharest")) || csay_str_eq(zone, csay_lit("Europe/Sofia"))) {
+        int64_t start = csay_utc_seconds(y, 3, csay_last_weekday(y, 3, 0), 1);
+        int64_t end = csay_utc_seconds(y, 10, csay_last_weekday(y, 10, 0), 1);
+        return seconds >= start && seconds < end;
+    }
+    if (csay_str_eq(zone, csay_lit("Australia/Sydney"))) {
+        int64_t start = csay_utc_seconds(y, 10, csay_nth_weekday(y, 10, 0, 1), 16) - 86400;
+        int64_t end = csay_utc_seconds(y, 4, csay_nth_weekday(y, 4, 0, 1), 16) - 86400;
+        return seconds >= start || seconds < end;
+    }
+    if (csay_str_eq(zone, csay_lit("Pacific/Auckland"))) {
+        int64_t start = csay_utc_seconds(y, 9, csay_last_weekday(y, 9, 0), 14) - 86400;
+        int64_t end = csay_utc_seconds(y, 4, csay_nth_weekday(y, 4, 0, 1), 14) - 86400;
+        return seconds >= start || seconds < end;
+    }
+    return 0;
+}
+
+static CsayStr csay_format_time_zone(CsayInt seconds, CsayStr format, CsayStr zone) {
+    if (zone.n == 0 || csay_str_eq(zone, csay_lit("本地")) || csay_str_eq(zone, csay_lit("local"))) {
+        return csay_format_time(seconds, format);
+    }
+    int offset = 0;
+    int named = 1;
+    if (csay_str_eq(zone, csay_lit("UTC")) || csay_str_eq(zone, csay_lit("Z")) || csay_str_eq(zone, csay_lit("Etc/UTC"))) {
+        offset = 0;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Shanghai")) || csay_str_eq(zone, csay_lit("Asia/Hong_Kong")) || csay_str_eq(zone, csay_lit("Asia/Singapore"))) {
+        offset = 8 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Tokyo")) || csay_str_eq(zone, csay_lit("Asia/Seoul"))) {
+        offset = 9 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Kolkata"))) {
+        offset = 5 * 3600 + 1800;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Kathmandu"))) {
+        offset = 5 * 3600 + 2700;
+    } else if (csay_str_eq(zone, csay_lit("Australia/Perth"))) {
+        offset = 8 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Pacific/Honolulu"))) {
+        offset = -10 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Europe/London")) || csay_str_eq(zone, csay_lit("Europe/Lisbon"))) {
+        offset = csay_zone_dst(zone, seconds) ? 3600 : 0;
+    } else if (csay_str_eq(zone, csay_lit("Europe/Paris")) || csay_str_eq(zone, csay_lit("Europe/Berlin")) || csay_str_eq(zone, csay_lit("Europe/Madrid")) || csay_str_eq(zone, csay_lit("Europe/Rome")) || csay_str_eq(zone, csay_lit("Europe/Amsterdam")) || csay_str_eq(zone, csay_lit("Europe/Brussels")) || csay_str_eq(zone, csay_lit("Europe/Vienna")) || csay_str_eq(zone, csay_lit("Europe/Stockholm")) || csay_str_eq(zone, csay_lit("Europe/Warsaw")) || csay_str_eq(zone, csay_lit("Europe/Zurich"))) {
+        offset = (csay_zone_dst(zone, seconds) ? 2 : 1) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Europe/Athens")) || csay_str_eq(zone, csay_lit("Europe/Helsinki")) || csay_str_eq(zone, csay_lit("Europe/Kyiv")) || csay_str_eq(zone, csay_lit("Europe/Bucharest")) || csay_str_eq(zone, csay_lit("Europe/Sofia"))) {
+        offset = (csay_zone_dst(zone, seconds) ? 3 : 2) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Europe/Moscow"))) {
+        offset = 3 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/New_York")) || csay_str_eq(zone, csay_lit("America/Toronto")) || csay_str_eq(zone, csay_lit("America/Detroit")) || csay_str_eq(zone, csay_lit("America/Havana"))) {
+        offset = (csay_zone_dst(zone, seconds) ? -4 : -5) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/Chicago")) || csay_str_eq(zone, csay_lit("America/Winnipeg"))) {
+        offset = (csay_zone_dst(zone, seconds) ? -5 : -6) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/Denver")) || csay_str_eq(zone, csay_lit("America/Edmonton"))) {
+        offset = (csay_zone_dst(zone, seconds) ? -6 : -7) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/Los_Angeles")) || csay_str_eq(zone, csay_lit("America/Vancouver"))) {
+        offset = (csay_zone_dst(zone, seconds) ? -7 : -8) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/Anchorage"))) {
+        offset = (csay_zone_dst(zone, seconds) ? -8 : -9) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/Halifax"))) {
+        offset = (csay_zone_dst(zone, seconds) ? -3 : -4) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/St_Johns"))) {
+        offset = csay_zone_dst(zone, seconds) ? -(2 * 3600 + 1800) : -(3 * 3600 + 1800);
+    } else if (csay_str_eq(zone, csay_lit("America/Phoenix"))) {
+        offset = -7 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/Mexico_City"))) {
+        offset = -6 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/Sao_Paulo"))) {
+        offset = -3 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Dubai"))) {
+        offset = 4 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Karachi"))) {
+        offset = 5 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Dhaka"))) {
+        offset = 6 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Yangon"))) {
+        offset = 6 * 3600 + 1800;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Bangkok")) || csay_str_eq(zone, csay_lit("Asia/Jakarta"))) {
+        offset = 7 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Asia/Manila")) || csay_str_eq(zone, csay_lit("Asia/Kuala_Lumpur")) || csay_str_eq(zone, csay_lit("Asia/Taipei"))) {
+        offset = 8 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Africa/Johannesburg"))) {
+        offset = 2 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("America/Bogota"))) {
+        offset = -5 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Europe/Istanbul"))) {
+        offset = 3 * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Australia/Sydney"))) {
+        offset = (csay_zone_dst(zone, seconds) ? 11 : 10) * 3600;
+    } else if (csay_str_eq(zone, csay_lit("Pacific/Auckland"))) {
+        offset = (csay_zone_dst(zone, seconds) ? 13 : 12) * 3600;
+    } else {
+        named = 0;
+    }
+    if (!named) {
+        if (zone.n <= 0 || zone.n >= 16) return csay_format_time_zone_fail();
+        char z[16];
+        memcpy(z, zone.p, (size_t)zone.n);
+        z[zone.n] = 0;
+        int sign = z[0] == '-' ? -1 : 1;
+        if (z[0] != '+' && z[0] != '-') return csay_format_time_zone_fail();
+        int oh = 0, om = 0, used = 0;
+        if (sscanf(z + 1, "%d:%d%n", &oh, &om, &used) != 2) {
+            used = 0;
+            if (sscanf(z + 1, "%2d%2d%n", &oh, &om, &used) != 2) return csay_format_time_zone_fail();
+        }
+        if (z[1 + used] != 0 || oh < 0 || oh > 23 || om < 0 || om > 59) return csay_format_time_zone_fail();
+        offset = sign * (oh * 3600 + om * 60);
+    }
+    time_t t = (time_t)(seconds + offset);
+    return csay_format_tm(gmtime(&t), format);
 }
 
 static CsayStr csay_now(void) {
@@ -460,7 +923,9 @@ static CsayStr csay_run_capture(CsayStr command) {
     for (;;) {
         if (len + 4096 + 1 > cap) {
             cap = cap * 2;
-            out = (char*)realloc(out, (size_t)cap);
+            char* bigger = (char*)csay_alloc(cap);
+            memcpy(bigger, out, (size_t)len);
+            out = bigger;
         }
         size_t got = fread(out + len, 1, 4096, f);
         len += (int64_t)got;
@@ -544,7 +1009,7 @@ typedef struct {
 } CsayList;
 
 static CsayList* csay_list_new(int64_t elem) {
-    CsayList* l = (CsayList*)malloc(sizeof(CsayList));
+    CsayList* l = (CsayList*)csay_alloc((int64_t)sizeof(CsayList));
     l->len = 0;
     l->cap = 8;
     l->elem = elem;
@@ -626,6 +1091,13 @@ static CsayInt csay_list_index_float(CsayList* l, CsayFloat v) {
     return -1;
 }
 
+static CsayInt csay_list_index_float32(CsayList* l, CsayFloat32 v) {
+    for (int64_t i = 0; i < l->len; i++) {
+        if (*(CsayFloat32*)(l->data + i * l->elem) == v) return i;
+    }
+    return -1;
+}
+
 static CsayInt csay_list_index_str(CsayList* l, CsayStr v) {
     for (int64_t i = 0; i < l->len; i++) {
         if (csay_str_eq(*(CsayStr*)(l->data + i * l->elem), v)) return i;
@@ -641,6 +1113,12 @@ static CsayBool csay_list_add_unique_int(CsayList* l, CsayInt v) {
 
 static CsayBool csay_list_add_unique_float(CsayList* l, CsayFloat v) {
     if (csay_list_index_float(l, v) >= 0) return false;
+    csay_list_add(l, &v);
+    return true;
+}
+
+static CsayBool csay_list_add_unique_float32(CsayList* l, CsayFloat32 v) {
+    if (csay_list_index_float32(l, v) >= 0) return false;
     csay_list_add(l, &v);
     return true;
 }
@@ -680,9 +1158,23 @@ static CsayFloat csay_list_pop_front_float(CsayList* l) {
     return v;
 }
 
+static CsayFloat32 csay_list_pop_front_float32(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("队列为空"), CSAY_ERR_INDEX)); return 0.0f; }
+    CsayFloat32 v = *(CsayFloat32*)l->data;
+    csay_list_remove(l, 0);
+    return v;
+}
+
 static CsayFloat csay_list_pop_back_float(CsayList* l) {
     if (l->len == 0) { csay_throw_error(csay_error(csay_lit("栈为空"), CSAY_ERR_INDEX)); return 0.0; }
     CsayFloat v = *(CsayFloat*)(l->data + (l->len - 1) * l->elem);
+    csay_list_remove(l, l->len - 1);
+    return v;
+}
+
+static CsayFloat32 csay_list_pop_back_float32(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("栈为空"), CSAY_ERR_INDEX)); return 0.0f; }
+    CsayFloat32 v = *(CsayFloat32*)(l->data + (l->len - 1) * l->elem);
     csay_list_remove(l, l->len - 1);
     return v;
 }
@@ -722,6 +1214,11 @@ static int csay_cmp_int(const void* a, const void* b) {
 
 static int csay_cmp_float(const void* a, const void* b) {
     CsayFloat x = *(const CsayFloat*)a, y = *(const CsayFloat*)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static int csay_cmp_float32(const void* a, const void* b) {
+    CsayFloat32 x = *(const CsayFloat32*)a, y = *(const CsayFloat32*)b;
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
@@ -877,136 +1374,6 @@ static CsayInt csay_find_text(CsayStr s, CsayStr sub) {
     return -1;
 }
 
-/* 轻量正则：字面量、.、*、+、?、^、$ 和反斜杠转义，不支持分组和字符类。 */
-static int csay_re_seq(const char* p, int n, int pos) {
-    if (pos < 0 || pos >= n) return 0;
-    int len = csay_utf8_seq_len((unsigned char)p[pos]);
-    if (len < 1) len = 1;
-    if (pos + len > n) len = n - pos;
-    return len;
-}
-
-static int csay_re_atom(const char* p, int pn, int pi, int* alen,
-                        const char** lit, int* litlen, int* dot) {
-    if (pi >= pn) return 0;
-    if (p[pi] == '\\' && pi + 1 < pn) {
-        int l = csay_re_seq(p, pn, pi + 1);
-        *lit = p + pi + 1;
-        *litlen = l;
-        *alen = 1 + l;
-        *dot = 0;
-        return 1;
-    }
-    if (p[pi] == '.') {
-        *lit = NULL;
-        *litlen = 0;
-        *alen = 1;
-        *dot = 1;
-        return 1;
-    }
-    int l = csay_re_seq(p, pn, pi);
-    *lit = p + pi;
-    *litlen = l;
-    *alen = l;
-    *dot = 0;
-    return 1;
-}
-
-static int csay_re_atom_next(const char* t, int tn, int ti,
-                             const char* lit, int litlen, int dot) {
-    if (dot) {
-        int l = csay_re_seq(t, tn, ti);
-        return l > 0 ? ti + l : -1;
-    }
-    if (ti + litlen > tn) return -1;
-    if (memcmp(t + ti, lit, (size_t)litlen) != 0) return -1;
-    return ti + litlen;
-}
-
-static int csay_re_match(const char* p, int pn, int pi, const char* t, int tn, int ti) {
-    if (pi >= pn) return ti;
-    if (p[pi] == '$' && pi + 1 == pn) return ti == tn ? ti : -1;
-    if (p[pi] == '^' && pi == 0) return ti == 0 ? csay_re_match(p, pn, pi + 1, t, tn, ti) : -1;
-    if (p[pi] == '*' || p[pi] == '+' || p[pi] == '?') return -1;
-
-    int alen = 0, litlen = 0, dot = 0;
-    const char* lit = NULL;
-    if (!csay_re_atom(p, pn, pi, &alen, &lit, &litlen, &dot)) return -1;
-    int next = pi + alen;
-    char q = next < pn ? p[next] : 0;
-    if (q != '*' && q != '+' && q != '?') {
-        int np = csay_re_atom_next(t, tn, ti, lit, litlen, dot);
-        return np < 0 ? -1 : csay_re_match(p, pn, next, t, tn, np);
-    }
-
-    int min = q == '+' ? 1 : 0;
-    int max = q == '?' ? 1 : 1000000000;
-    int pos = ti;
-    int count = 0;
-    while (count < max) {
-        int np = csay_re_atom_next(t, tn, pos, lit, litlen, dot);
-        if (np < 0) break;
-        pos = np;
-        count++;
-    }
-    for (int k = count; k >= min; k--) {
-        int p2 = ti;
-        for (int j = 0; j < k; j++) p2 = csay_re_atom_next(t, tn, p2, lit, litlen, dot);
-        int r = csay_re_match(p, pn, next + 1, t, tn, p2);
-        if (r >= 0) return r;
-    }
-    return -1;
-}
-
-static CsayInt csay_regex_search(CsayStr text, CsayStr pat, CsayInt* endOut) {
-    int start = 0;
-    while (start <= text.n) {
-        int r = csay_re_match(pat.p, (int)pat.n, 0, text.p, (int)text.n, start);
-        if (r >= 0) {
-            *endOut = r;
-            return start;
-        }
-        if (start == text.n) break;
-        int l = csay_re_seq(text.p, (int)text.n, start);
-        start += l > 0 ? l : 1;
-    }
-    return -1;
-}
-
-static CsayBool csay_regex_match(CsayStr text, CsayStr pat) {
-    CsayInt end = 0;
-    return csay_regex_search(text, pat, &end) >= 0;
-}
-
-static CsayInt csay_regex_find(CsayStr text, CsayStr pat) {
-    CsayInt end = 0;
-    CsayInt at = csay_regex_search(text, pat, &end);
-    if (at < 0) return -1;
-    CsayInt n = 0;
-    for (CsayInt i = 0; i < at; i++) {
-        if (((unsigned char)text.p[i] & 0xC0) != 0x80) n++;
-    }
-    return n;
-}
-
-static CsayStr csay_regex_replace(CsayStr text, CsayStr pat, CsayStr rep) {
-    CsayInt end = 0;
-    CsayInt at = csay_regex_search(text, pat, &end);
-    if (at < 0) {
-        char* q = (char*)csay_alloc(text.n + 1);
-        memcpy(q, text.p, (size_t)text.n);
-        q[text.n] = 0;
-        return csay_str(q, text.n);
-    }
-    CsayInt total = at + rep.n + (text.n - end);
-    char* p = (char*)csay_alloc(total + 1);
-    memcpy(p, text.p, (size_t)at);
-    memcpy(p + at, rep.p, (size_t)rep.n);
-    memcpy(p + at + rep.n, text.p + end, (size_t)(text.n - end));
-    p[total] = 0;
-    return csay_str(p, total);
-}
-
 static CsayStr csay_json_text(CsayStr s) {
     char* p = (char*)csay_alloc(s.n * 6 + 3);
     int64_t o = 0;
@@ -1058,6 +1425,8 @@ static CsayStr csay_json_list(CsayList* l, int kind) {
             v = csay_str_of_int(*(CsayInt*)csay_list_at(l, i));
         } else if (kind == 2) {
             v = csay_str_of_float(*(CsayFloat*)csay_list_at(l, i));
+        } else if (kind == 4) {
+            v = csay_str_of_float32(*(CsayFloat32*)csay_list_at(l, i));
         } else {
             v = csay_json_bool(*(CsayBool*)csay_list_at(l, i));
         }
@@ -1124,6 +1493,22 @@ static void csay_list_unique_float(CsayList* l) {
     l->len = w;
 }
 
+static void csay_list_unique_float32(CsayList* l) {
+    int64_t w = 0;
+    for (int64_t i = 0; i < l->len; i++) {
+        CsayFloat32 v = *(CsayFloat32*)(l->data + i * l->elem);
+        int dup = 0;
+        for (int64_t j = 0; j < w; j++) {
+            if (*(CsayFloat32*)(l->data + j * l->elem) == v) { dup = 1; break; }
+        }
+        if (!dup) {
+            if (w != i) memcpy(l->data + w * l->elem, l->data + i * l->elem, (size_t)l->elem);
+            w++;
+        }
+    }
+    l->len = w;
+}
+
 static void csay_list_unique_str(CsayList* l) {
     int64_t w = 0;
     for (int64_t i = 0; i < l->len; i++) {
@@ -1141,6 +1526,7 @@ static void csay_list_unique_str(CsayList* l) {
 }
 
 static CsayInt csay_list_max_int(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("列表为空"), CSAY_ERR_INDEX)); return 0; }
     CsayInt m = *(CsayInt*)l->data;
     for (int64_t i = 1; i < l->len; i++) {
         CsayInt v = *(CsayInt*)(l->data + i * l->elem);
@@ -1150,6 +1536,7 @@ static CsayInt csay_list_max_int(CsayList* l) {
 }
 
 static CsayFloat csay_list_max_float(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("列表为空"), CSAY_ERR_INDEX)); return 0.0; }
     CsayFloat m = *(CsayFloat*)l->data;
     for (int64_t i = 1; i < l->len; i++) {
         CsayFloat v = *(CsayFloat*)(l->data + i * l->elem);
@@ -1158,7 +1545,18 @@ static CsayFloat csay_list_max_float(CsayList* l) {
     return m;
 }
 
+static CsayFloat32 csay_list_max_float32(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("列表为空"), CSAY_ERR_INDEX)); return 0.0f; }
+    CsayFloat32 m = *(CsayFloat32*)l->data;
+    for (int64_t i = 1; i < l->len; i++) {
+        CsayFloat32 v = *(CsayFloat32*)(l->data + i * l->elem);
+        if (v > m) m = v;
+    }
+    return m;
+}
+
 static CsayStr csay_list_max_str(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("列表为空"), CSAY_ERR_INDEX)); return csay_lit(""); }
     CsayStr m = *(CsayStr*)l->data;
     for (int64_t i = 1; i < l->len; i++) {
         CsayStr v = *(CsayStr*)(l->data + i * l->elem);
@@ -1167,9 +1565,49 @@ static CsayStr csay_list_max_str(CsayList* l) {
     return m;
 }
 
+static CsayInt csay_list_min_int(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("列表为空"), CSAY_ERR_INDEX)); return 0; }
+    CsayInt m = *(CsayInt*)l->data;
+    for (int64_t i = 1; i < l->len; i++) {
+        CsayInt v = *(CsayInt*)(l->data + i * l->elem);
+        if (v < m) m = v;
+    }
+    return m;
+}
+
+static CsayFloat csay_list_min_float(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("列表为空"), CSAY_ERR_INDEX)); return 0.0; }
+    CsayFloat m = *(CsayFloat*)l->data;
+    for (int64_t i = 1; i < l->len; i++) {
+        CsayFloat v = *(CsayFloat*)(l->data + i * l->elem);
+        if (v < m) m = v;
+    }
+    return m;
+}
+
+static CsayFloat32 csay_list_min_float32(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("列表为空"), CSAY_ERR_INDEX)); return 0.0f; }
+    CsayFloat32 m = *(CsayFloat32*)l->data;
+    for (int64_t i = 1; i < l->len; i++) {
+        CsayFloat32 v = *(CsayFloat32*)(l->data + i * l->elem);
+        if (v < m) m = v;
+    }
+    return m;
+}
+
+static CsayStr csay_list_min_str(CsayList* l) {
+    if (l->len == 0) { csay_throw_error(csay_error(csay_lit("列表为空"), CSAY_ERR_INDEX)); return csay_lit(""); }
+    CsayStr m = *(CsayStr*)l->data;
+    for (int64_t i = 1; i < l->len; i++) {
+        CsayStr v = *(CsayStr*)(l->data + i * l->elem);
+        if (csay_cmp_str(&v, &m) < 0) m = v;
+    }
+    return m;
+}
+
 /**
  * 把文本复制到当前区域之外。
- * 用法：区域 { 文本 t = ...; 返回 保留(t); }
+ * 用法：区域 { 文本 t = ...; 返回 移出区域(t); }
  * 先退到外层分配器上复制，再恢复当前区域，这样区域回收后返回值仍然有效。
  */
 static CsayStr csay_keep_str(CsayStr s) {
@@ -1206,7 +1644,7 @@ static CsayList* csay_args(void) {
         buf[n] = 0;
         if (index > 0) {
             int bytes = WideCharToMultiByte(65001, 0, buf, n, NULL, 0, NULL, NULL);
-            char* p = (char*)malloc((size_t)bytes + 1);
+            char* p = (char*)csay_alloc(bytes + 1);
             WideCharToMultiByte(65001, 0, buf, n, p, bytes, NULL, NULL);
             p[bytes] = 0;
             CsayStr s = csay_str(p, bytes);
@@ -1263,10 +1701,18 @@ static int csay_eq_int(const void* a, const void* b) {
     return *(const CsayInt*)a == *(const CsayInt*)b;
 }
 
+/* 真假键 */
+static uint64_t csay_hash_bool(const void* p) {
+    return *(const CsayBool*)p ? 1 : 0;
+}
+static int csay_eq_bool(const void* a, const void* b) {
+    return *(const CsayBool*)a == *(const CsayBool*)b;
+}
+
 static CsayMap* csay_map_new(int64_t keySize, int64_t valSize,
                              uint64_t (*hash)(const void*),
                              int (*eq)(const void*, const void*)) {
-    CsayMap* m = (CsayMap*)malloc(sizeof(CsayMap));
+    CsayMap* m = (CsayMap*)csay_alloc((int64_t)sizeof(CsayMap));
     m->cap = 16;
     m->len = 0;
     m->keySize = keySize;
@@ -1336,6 +1782,11 @@ static void* csay_map_ptr_or(CsayMap* m, const void* k, void* def) {
     return p == NULL ? def : p;
 }
 
+static CsayStr csay_map_text_or(CsayMap* m, const void* k, CsayStr def) {
+    if (m == NULL) return def;
+    return *(CsayStr*)csay_map_ptr_or(m, k, &def);
+}
+
 static void* csay_map_at(CsayMap* m, const void* k) {
     void* p = csay_map_ptr(m, k);
     if (p == NULL) {
@@ -1369,6 +1820,482 @@ static void csay_map_remove(CsayMap* m, const void* k) {
         m->used[h] = 1;
         m->len++;
     }
+}
+
+static CsayStr csay_json_array(const void* a, CsayInt n, int kind) {
+    int64_t cap = 3;
+    for (CsayInt i = 0; i < n; i++) {
+        if (kind == 0) cap += ((CsayStr*)a)[i].n * 6 + 3;
+        else cap += 80;
+    }
+    char* p = (char*)csay_alloc(cap);
+    int64_t o = 0;
+    p[o++] = '[';
+    for (CsayInt i = 0; i < n; i++) {
+        if (i > 0) p[o++] = ',';
+        CsayStr v;
+        if (kind == 0) v = csay_json_text(((CsayStr*)a)[i]);
+        else if (kind == 1) v = csay_str_of_int(((CsayInt*)a)[i]);
+        else if (kind == 2) v = csay_str_of_float(((CsayFloat*)a)[i]);
+        else if (kind == 4) v = csay_str_of_float32(((CsayFloat32*)a)[i]);
+        else v = csay_json_bool(((CsayBool*)a)[i]);
+        memcpy(p + o, v.p, (size_t)v.n);
+        o += v.n;
+    }
+    p[o++] = ']';
+    p[o] = 0;
+    return csay_str(p, o);
+}
+
+static CsayStr csay_json_map(CsayMap* m, int kind) {
+    int64_t cap = 3;
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayStr k = *(CsayStr*)(m->keys + i * m->keySize);
+        cap += k.n * 6 + 3 + 48;
+    }
+    char* p = (char*)csay_alloc(cap);
+    int64_t o = 0;
+    int first = 1;
+    p[o++] = '{';
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayStr k = *(CsayStr*)(m->keys + i * m->keySize);
+        CsayStr key = csay_json_text(k);
+        if (!first) p[o++] = ',';
+        first = 0;
+        memcpy(p + o, key.p, (size_t)key.n);
+        o += key.n;
+        p[o++] = ':';
+        void* v = m->vals + i * m->valSize;
+        CsayStr val;
+        if (kind == 0) val = csay_json_text(*(CsayStr*)v);
+        else if (kind == 1) val = csay_str_of_int(*(CsayInt*)v);
+        else if (kind == 2) val = csay_str_of_float(*(CsayFloat*)v);
+        else if (kind == 4) val = csay_str_of_float32(*(CsayFloat32*)v);
+        else val = csay_json_bool(*(CsayBool*)v);
+        memcpy(p + o, val.p, (size_t)val.n);
+        o += val.n;
+    }
+    p[o++] = '}';
+    p[o] = 0;
+    return csay_str(p, o);
+}
+
+/* 轻量正则：字面量、.、*、+、?、{m,n}、^、$、分组、分支、转义和字符类。
+   字符类支持 ASCII 范围和 \d、\w、\s；分组只用于组合，不保存捕获结果。 */
+#define CSAY_RE_POS_MAX 2048
+
+typedef struct CsayReNode CsayReNode;
+typedef struct {
+    int* a;
+    int n;
+} CsayRePos;
+
+struct CsayReNode {
+    int kind;
+    const char* lit;
+    int litlen;
+    const char* cls;
+    int clslen;
+    int neg;
+    int min;
+    int max;
+    CsayReNode* a;
+    CsayReNode* b;
+};
+
+enum {
+    CSAY_RE_EMPTY = 0,
+    CSAY_RE_SEQ,
+    CSAY_RE_ALT,
+    CSAY_RE_LIT,
+    CSAY_RE_DOT,
+    CSAY_RE_CLASS,
+    CSAY_RE_GROUP,
+    CSAY_RE_REPEAT,
+    CSAY_RE_BOL,
+    CSAY_RE_EOL
+};
+
+static int csay_re_seq(const char* p, int n, int pos) {
+    if (pos < 0 || pos >= n) return 0;
+    int len = csay_utf8_seq_len((unsigned char)p[pos]);
+    if (len < 1) len = 1;
+    if (pos + len > n) len = n - pos;
+    return len;
+}
+
+static int csay_re_class_next(const char* t, int tn, int ti,
+                              const char* cls, int n, int neg) {
+    if (ti >= tn) return -1;
+    int l = csay_re_seq(t, tn, ti);
+    if (l <= 0) return -1;
+    unsigned char c = (unsigned char)t[ti];
+    int matched = 0;
+    for (int i = 0; i < n;) {
+        if (cls[i] == '\\' && i + 1 < n) {
+            char e = cls[i + 1];
+            i += 2;
+            if (e == 'd') matched |= c >= '0' && c <= '9';
+            else if (e == 'w') matched |= (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+            else if (e == 's') matched |= c == ' ' || c == '\t' || c == '\n' || c == '\r';
+            else if (e == 'D') matched |= !(c >= '0' && c <= '9');
+            else if (e == 'W') matched |= !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_');
+            else if (e == 'S') matched |= !(c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            else matched |= l == 1 && c == (unsigned char)e;
+            continue;
+        }
+        if (l == 1 && i + 2 < n && cls[i + 1] == '-') {
+            unsigned char a = (unsigned char)cls[i];
+            unsigned char b = (unsigned char)cls[i + 2];
+            if (c >= a && c <= b) matched = 1;
+            i += 3;
+            continue;
+        }
+        int cl = csay_re_seq(cls, n, i);
+        if (cl == l && memcmp(t + ti, cls + i, (size_t)cl) == 0) matched = 1;
+        i += cl;
+    }
+    if (neg) matched = !matched;
+    return matched ? ti + l : -1;
+}
+
+static CsayReNode* csay_re_new(int kind) {
+    CsayReNode* n = (CsayReNode*)csay_alloc(sizeof(CsayReNode));
+    memset(n, 0, sizeof(CsayReNode));
+    n->kind = kind;
+    return n;
+}
+
+static CsayReNode* csay_re_parse_alt(const char* p, int n, int* pi);
+
+static CsayReNode* csay_re_parse_seq(const char* p, int n, int* pi) {
+    CsayReNode* seq = NULL;
+    while (*pi < n && p[*pi] != '|' && p[*pi] != ')') {
+        CsayReNode* item = NULL;
+        /* 解析一个带可选数量词的原子。原子解析失败时避免死循环。 */
+        int before = *pi;
+        char c = p[*pi];
+        if (c == '(') {
+            (*pi)++;
+            CsayReNode* child = csay_re_parse_alt(p, n, pi);
+            if (*pi < n && p[*pi] == ')') (*pi)++;
+            item = csay_re_new(CSAY_RE_GROUP);
+            item->a = child;
+        } else if (c == '[') {
+            int j = *pi + 1;
+            int neg = 0;
+            if (j < n && p[j] == '^') { neg = 1; j++; }
+            int content = j;
+            while (j < n && p[j] != ']') {
+                if (p[j] == '\\' && j + 1 < n) j += 2;
+                else j += csay_re_seq(p, n, j);
+            }
+            if (j < n) {
+                item = csay_re_new(CSAY_RE_CLASS);
+                item->cls = p + content;
+                item->clslen = j - content;
+                item->neg = neg;
+                *pi = j + 1;
+            }
+        } else if (c == '\\') {
+            if (*pi + 1 >= n) {
+                item = csay_re_new(CSAY_RE_LIT);
+                item->lit = p + *pi;
+                item->litlen = 1;
+                (*pi)++;
+            } else {
+                char e = p[*pi + 1];
+                if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
+                    item = csay_re_new(CSAY_RE_CLASS);
+                    item->cls = p + *pi;
+                    item->clslen = 2;
+                    *pi += 2;
+                } else {
+                    int l = csay_re_seq(p, n, *pi + 1);
+                    item = csay_re_new(CSAY_RE_LIT);
+                    item->lit = p + *pi + 1;
+                    item->litlen = l;
+                    *pi += 1 + l;
+                }
+            }
+        } else if (c == '.') {
+            item = csay_re_new(CSAY_RE_DOT);
+            (*pi)++;
+        } else if (c == '^') {
+            item = csay_re_new(CSAY_RE_BOL);
+            (*pi)++;
+        } else if (c == '$') {
+            item = csay_re_new(CSAY_RE_EOL);
+            (*pi)++;
+        } else if (c == '|' || c == ')') {
+            break;
+        } else {
+            int l = csay_re_seq(p, n, *pi);
+            item = csay_re_new(CSAY_RE_LIT);
+            item->lit = p + *pi;
+            item->litlen = l;
+            *pi += l;
+        }
+        if (*pi == before) break;
+        if (item == NULL) break;
+        if (*pi < n && (p[*pi] == '*' || p[*pi] == '+' || p[*pi] == '?' || p[*pi] == '{')) {
+            int lo = 0, hi = 0;
+            int valid = 1;
+            if (p[*pi] == '*') { lo = 0; hi = -1; (*pi)++; }
+            else if (p[*pi] == '+') { lo = 1; hi = -1; (*pi)++; }
+            else if (p[*pi] == '?') { lo = 0; hi = 1; (*pi)++; }
+            else {
+                int save = *pi;
+                (*pi)++;
+                if (*pi >= n || p[*pi] < '0' || p[*pi] > '9') {
+                    *pi = save;
+                    valid = 0;
+                } else {
+                    lo = 0;
+                    while (*pi < n && p[*pi] >= '0' && p[*pi] <= '9') {
+                        lo = lo * 10 + (p[*pi] - '0');
+                        (*pi)++;
+                    }
+                    hi = lo;
+                    if (*pi < n && p[*pi] == ',') {
+                        (*pi)++;
+                        if (*pi < n && p[*pi] >= '0' && p[*pi] <= '9') {
+                            hi = 0;
+                            while (*pi < n && p[*pi] >= '0' && p[*pi] <= '9') {
+                                hi = hi * 10 + (p[*pi] - '0');
+                                (*pi)++;
+                            }
+                        } else {
+                            hi = -1;
+                        }
+                    }
+                    if (*pi >= n || p[*pi] != '}' || (hi >= 0 && hi < lo)) {
+                        *pi = save;
+                        valid = 0;
+                    } else {
+                        (*pi)++;
+                    }
+                }
+            }
+            if (valid) {
+                CsayReNode* rep = csay_re_new(CSAY_RE_REPEAT);
+                rep->a = item;
+                rep->min = lo;
+                rep->max = hi;
+                item = rep;
+            }
+        }
+        if (!seq) seq = item;
+        else {
+            CsayReNode* s = csay_re_new(CSAY_RE_SEQ);
+            s->a = seq;
+            s->b = item;
+            seq = s;
+        }
+    }
+    if (!seq) return csay_re_new(CSAY_RE_EMPTY);
+    return seq;
+}
+
+static CsayReNode* csay_re_parse_alt(const char* p, int n, int* pi) {
+    CsayReNode* left = csay_re_parse_seq(p, n, pi);
+    while (*pi < n && p[*pi] == '|') {
+        (*pi)++;
+        CsayReNode* right = csay_re_parse_seq(p, n, pi);
+        CsayReNode* node = csay_re_new(CSAY_RE_ALT);
+        node->a = left;
+        node->b = right;
+        left = node;
+    }
+    return left;
+}
+
+static void csay_re_pos_push(CsayRePos* r, int v) {
+    if (r->n >= CSAY_RE_POS_MAX) return;
+    for (int i = 0; i < r->n; i++) if (r->a[i] == v) return;
+    r->a[r->n++] = v;
+}
+
+static void csay_re_pos_init(CsayRePos* r) {
+    r->a = (int*)csay_alloc(sizeof(int) * CSAY_RE_POS_MAX);
+    r->n = 0;
+}
+
+static void csay_re_positions(CsayReNode* node, const char* t, int tn, int ti, CsayRePos* out);
+
+static void csay_re_positions_repeat(CsayReNode* node, const char* t, int tn, int ti, CsayRePos* out) {
+    if (node->min > 2048) return;
+    if (node->max < 0) {
+        int max = 256;
+        if (node->min > max) max = node->min;
+        CsayRePos* levels = (CsayRePos*)csay_alloc(sizeof(CsayRePos) * (max + 1));
+        csay_re_pos_init(&levels[0]);
+        csay_re_pos_push(&levels[0], ti);
+        int last = 0;
+        for (int k = 1; k <= max; k++) {
+            CsayRePos next;
+            csay_re_pos_init(&next);
+            for (int i = 0; i < levels[last].n; i++) {
+                CsayRePos tmp;
+                csay_re_pos_init(&tmp);
+                csay_re_positions(node->a, t, tn, levels[last].a[i], &tmp);
+                for (int j = 0; j < tmp.n; j++) csay_re_pos_push(&next, tmp.a[j]);
+            }
+            if (next.n == 0) break;
+            levels[k] = next;
+            last = k;
+            /* 空匹配的重复不再产生新位置。 */
+            int same = next.n == levels[k - 1].n;
+            for (int i = 0; same && i < next.n; i++) if (next.a[i] != levels[k - 1].a[i]) same = 0;
+            if (same) {
+                if (node->min > last) {
+                    for (int i = 0; i < levels[last].n; i++) csay_re_pos_push(out, levels[last].a[i]);
+                }
+                break;
+            }
+        }
+        for (int k = last; k >= node->min; k--) {
+            for (int i = 0; i < levels[k].n; i++) csay_re_pos_push(out, levels[k].a[i]);
+        }
+        if (node->min == 0) csay_re_pos_push(out, ti);
+        return;
+    }
+    int max = node->max;
+    if (max > 2048) max = 2048;
+    CsayRePos* levels = (CsayRePos*)csay_alloc(sizeof(CsayRePos) * (max + 1));
+    csay_re_pos_init(&levels[0]);
+    csay_re_pos_push(&levels[0], ti);
+    int last = 0;
+    for (int k = 1; k <= max; k++) {
+        CsayRePos next;
+        csay_re_pos_init(&next);
+        for (int i = 0; i < levels[last].n; i++) {
+            CsayRePos tmp;
+            csay_re_pos_init(&tmp);
+            csay_re_positions(node->a, t, tn, levels[last].a[i], &tmp);
+            for (int j = 0; j < tmp.n; j++) csay_re_pos_push(&next, tmp.a[j]);
+        }
+        if (next.n == 0) break;
+        levels[k] = next;
+        last = k;
+    }
+    for (int k = last; k >= node->min; k--) {
+        for (int i = 0; i < levels[k].n; i++) csay_re_pos_push(out, levels[k].a[i]);
+    }
+    if (node->min == 0) csay_re_pos_push(out, ti);
+}
+
+static void csay_re_positions(CsayReNode* node, const char* t, int tn, int ti, CsayRePos* out) {
+    if (node == NULL || node->kind == CSAY_RE_EMPTY) {
+        csay_re_pos_push(out, ti);
+        return;
+    }
+    switch (node->kind) {
+    case CSAY_RE_SEQ: {
+        CsayRePos mid;
+        csay_re_pos_init(&mid);
+        csay_re_positions(node->a, t, tn, ti, &mid);
+        for (int i = 0; i < mid.n; i++) {
+            CsayRePos tmp;
+            csay_re_pos_init(&tmp);
+            csay_re_positions(node->b, t, tn, mid.a[i], &tmp);
+            for (int j = 0; j < tmp.n; j++) csay_re_pos_push(out, tmp.a[j]);
+        }
+        return;
+    }
+    case CSAY_RE_ALT:
+        csay_re_positions(node->a, t, tn, ti, out);
+        csay_re_positions(node->b, t, tn, ti, out);
+        return;
+    case CSAY_RE_GROUP:
+        csay_re_positions(node->a, t, tn, ti, out);
+        return;
+    case CSAY_RE_REPEAT:
+        csay_re_positions_repeat(node, t, tn, ti, out);
+        return;
+    case CSAY_RE_LIT:
+        if (ti + node->litlen <= tn && memcmp(t + ti, node->lit, (size_t)node->litlen) == 0) {
+            csay_re_pos_push(out, ti + node->litlen);
+        }
+        return;
+    case CSAY_RE_DOT: {
+        int l = csay_re_seq(t, tn, ti);
+        if (l > 0) csay_re_pos_push(out, ti + l);
+        return;
+    }
+    case CSAY_RE_CLASS: {
+        int np = csay_re_class_next(t, tn, ti, node->cls, node->clslen, node->neg);
+        if (np >= 0) csay_re_pos_push(out, np);
+        return;
+    }
+    case CSAY_RE_BOL:
+        if (ti == 0) csay_re_pos_push(out, ti);
+        return;
+    case CSAY_RE_EOL:
+        if (ti == tn) csay_re_pos_push(out, ti);
+        return;
+    default:
+        return;
+    }
+}
+
+static CsayInt csay_regex_search(CsayStr text, CsayStr pat, CsayInt* endOut) {
+    CsayRegion* region = csay_region_begin();
+    int pi = 0;
+    CsayReNode* root = csay_re_parse_alt(pat.p, (int)pat.n, &pi);
+    int start = 0;
+    int found = -1;
+    while (start <= text.n) {
+        CsayRePos out;
+        csay_re_pos_init(&out);
+        csay_re_positions(root, text.p, (int)text.n, start, &out);
+        if (out.n > 0) {
+            *endOut = out.a[0];
+            found = start;
+            break;
+        }
+        if (start == text.n) break;
+        int l = csay_re_seq(text.p, (int)text.n, start);
+        start += l > 0 ? l : 1;
+    }
+    csay_region_end(region);
+    return found;
+}
+
+static CsayBool csay_regex_match(CsayStr text, CsayStr pat) {
+    CsayInt end = 0;
+    return csay_regex_search(text, pat, &end) >= 0;
+}
+
+static CsayInt csay_regex_find(CsayStr text, CsayStr pat) {
+    CsayInt end = 0;
+    CsayInt at = csay_regex_search(text, pat, &end);
+    if (at < 0) return -1;
+    CsayInt n = 0;
+    for (CsayInt i = 0; i < at; i++) {
+        if (((unsigned char)text.p[i] & 0xC0) != 0x80) n++;
+    }
+    return n;
+}
+
+static CsayStr csay_regex_replace(CsayStr text, CsayStr pat, CsayStr rep) {
+    CsayInt end = 0;
+    CsayInt at = csay_regex_search(text, pat, &end);
+    if (at < 0) {
+        char* q = (char*)csay_alloc(text.n + 1);
+        memcpy(q, text.p, (size_t)text.n);
+        q[text.n] = 0;
+        return csay_str(q, text.n);
+    }
+    CsayInt total = at + rep.n + (text.n - end);
+    char* p = (char*)csay_alloc(total + 1);
+    memcpy(p, text.p, (size_t)at);
+    memcpy(p + at, rep.p, (size_t)rep.n);
+    memcpy(p + at + rep.n, text.p + end, (size_t)(text.n - end));
+    p[total] = 0;
+    return csay_str(p, total);
 }
 
 /* ---------------- JSON：解析成一层 键 -> 文本 表 ----------------
@@ -1680,16 +2607,227 @@ static CsayMap* csay_json_parse(CsayStr s) {
     return m;
 }
 
+static void csay_json_path_fail(void) {
+    csay_throw_error(csay_error(csay_lit("JSON 路径不存在"), CSAY_ERR_FORMAT));
+}
+
+/* 按 a.b[0].c 读取嵌套值；返回字符串解码后的文本，对象/数组返回原始 JSON。 */
+static CsayStr csay_json_get(CsayStr s, CsayStr path) {
+    if (path.n == 0) return s;
+    CsayStr cur = s;
+    int64_t i = 0;
+    while (i < path.n) {
+        CsayStr key;
+        if (path.p[i] == '[') {
+            int64_t start = i;
+            i++;
+            if (i >= path.n || path.p[i] < '0' || path.p[i] > '9') {
+                csay_json_path_fail();
+                return csay_lit("");
+            }
+            while (i < path.n && path.p[i] >= '0' && path.p[i] <= '9') i++;
+            if (i >= path.n || path.p[i] != ']') {
+                csay_json_path_fail();
+                return csay_lit("");
+            }
+            i++;
+            key = csay_json_span(path.p + start, path.p + i);
+        } else {
+            int64_t start = i;
+            while (i < path.n && path.p[i] != '.' && path.p[i] != '[') i++;
+            if (i == start) {
+                csay_json_path_fail();
+                return csay_lit("");
+            }
+            key = csay_json_span(path.p + start, path.p + i);
+        }
+        CsayMap* m = csay_json_parse(cur);
+        CsayStr* slot = (CsayStr*)csay_map_ptr(m, &key);
+        if (slot == NULL) {
+            csay_json_path_fail();
+            return csay_lit("");
+        }
+        cur = *slot;
+        if (i < path.n) {
+            if (path.p[i] == '.') {
+                i++;
+                if (i >= path.n) {
+                    csay_json_path_fail();
+                    return csay_lit("");
+                }
+            } else if (path.p[i] != '[') {
+                csay_json_path_fail();
+                return csay_lit("");
+            }
+        }
+    }
+    return cur;
+}
+
+/* 解析路径的一段。at 指向段首，返回时指向下一段，或 path.n。 */
+static void csay_json_path_next(CsayStr path, int64_t* at, CsayStr* key, int* is_index, int64_t* index) {
+    int64_t i = *at;
+    if (i >= path.n) csay_json_path_fail();
+    if (path.p[i] == '[') {
+        i++;
+        if (i >= path.n || path.p[i] < '0' || path.p[i] > '9') {
+            csay_json_path_fail();
+            return;
+        }
+        int64_t n = 0;
+        while (i < path.n && path.p[i] >= '0' && path.p[i] <= '9') {
+            n = n * 10 + (path.p[i] - '0');
+            if (n > 1000000000) { csay_json_path_fail(); return; }
+            i++;
+        }
+        if (i >= path.n || path.p[i] != ']') {
+            csay_json_path_fail();
+            return;
+        }
+        i++;
+        *is_index = 1;
+        *index = n;
+        *key = csay_lit("");
+    } else {
+        int64_t start = i;
+        while (i < path.n && path.p[i] != '.' && path.p[i] != '[') i++;
+        if (i == start) {
+            csay_json_path_fail();
+            return;
+        }
+        *key = csay_json_span(path.p + start, path.p + i);
+        *is_index = 0;
+        *index = 0;
+    }
+    if (i < path.n) {
+        if (path.p[i] == '.') {
+            i++;
+            if (i >= path.n) { csay_json_path_fail(); return; }
+        } else if (path.p[i] != '[') {
+            csay_json_path_fail();
+            return;
+        }
+    }
+    *at = i;
+}
+
+/* 在 JSON 文本的一层对象或数组里找到某个键/下标对应的原始值范围。 */
+static int csay_json_find_value(CsayStr s, CsayStr key, int is_index, int64_t index,
+                                const char** vstart, const char** vend) {
+    csay_json_p = s.p;
+    csay_json_end = s.p + s.n;
+    csay_json_ws();
+    if (is_index) {
+        if (csay_json_p >= csay_json_end || *csay_json_p != '[') return 0;
+        csay_json_p++;
+        csay_json_ws();
+        if (csay_json_p < csay_json_end && *csay_json_p == ']') return 0;
+        int64_t n = 0;
+        for (;;) {
+            csay_json_ws();
+            const char* a = csay_json_p;
+            csay_json_skip_value();
+            const char* b = csay_json_p;
+            if (n == index) {
+                *vstart = a;
+                *vend = b;
+                return 1;
+            }
+            n++;
+            csay_json_ws();
+            if (csay_json_p < csay_json_end && *csay_json_p == ',') {
+                csay_json_p++;
+                continue;
+            }
+            if (csay_json_p < csay_json_end && *csay_json_p == ']') return 0;
+            csay_json_fail();
+            return 0;
+        }
+    }
+    if (csay_json_p >= csay_json_end || *csay_json_p != '{') return 0;
+    csay_json_p++;
+    csay_json_ws();
+    if (csay_json_p < csay_json_end && *csay_json_p == '}') return 0;
+    for (;;) {
+        CsayStr k = csay_json_string();
+        csay_json_ws();
+        if (csay_json_p >= csay_json_end || *csay_json_p != ':') {
+            csay_json_fail();
+            return 0;
+        }
+        csay_json_p++;
+        csay_json_ws();
+        const char* a = csay_json_p;
+        csay_json_skip_value();
+        const char* b = csay_json_p;
+        if (k.n == key.n && memcmp(k.p, key.p, (size_t)k.n) == 0) {
+            *vstart = a;
+            *vend = b;
+            return 1;
+        }
+        csay_json_ws();
+        if (csay_json_p < csay_json_end && *csay_json_p == ',') {
+            csay_json_p++;
+            csay_json_ws();
+            continue;
+        }
+        if (csay_json_p < csay_json_end && *csay_json_p == '}') return 0;
+        csay_json_fail();
+        return 0;
+    }
+}
+
+static CsayStr csay_json_splice(CsayStr s, const char* a, const char* b, CsayStr value) {
+    int64_t pre = (int64_t)(a - s.p);
+    int64_t post = (int64_t)((s.p + s.n) - b);
+    int64_t n = pre + value.n + post;
+    char* q = (char*)csay_alloc(n + 1);
+    memcpy(q, s.p, (size_t)pre);
+    memcpy(q + pre, value.p, (size_t)value.n);
+    memcpy(q + pre + value.n, b, (size_t)post);
+    q[n] = 0;
+    return csay_str(q, n);
+}
+
+static CsayStr csay_json_set_at(CsayStr s, CsayStr path, int64_t at, CsayStr value) {
+    if (at >= path.n) return value;
+    CsayStr key;
+    int is_index = 0;
+    int64_t index = 0;
+    csay_json_path_next(path, &at, &key, &is_index, &index);
+    const char* a = NULL;
+    const char* b = NULL;
+    if (!csay_json_find_value(s, key, is_index, index, &a, &b)) {
+        csay_json_path_fail();
+        return csay_lit("");
+    }
+    CsayStr child = csay_json_span(a, b);
+    CsayStr repl = at < path.n ? csay_json_set_at(child, path, at, value) : value;
+    return csay_json_splice(s, a, b, repl);
+}
+
+/* 替换路径上的值；新值必须是合法 JSON 文本，例如 文本 要带引号。 */
+static CsayStr csay_json_set(CsayStr s, CsayStr path, CsayStr value) {
+    return csay_json_set_at(s, path, 0, value);
+}
+
 /* 条目遍历：每个 键×值 组合一份结构和一个遍历函数 */
 
 typedef struct { CsayStr key; CsayInt val; } CsayEntry_文本_整数;
-typedef struct { CsayStr key; CsayFloat val; } CsayEntry_文本_小数;
+typedef struct { CsayStr key; CsayFloat32 val; } CsayEntry_文本_浮点数;
+typedef struct { CsayStr key; CsayFloat val; } CsayEntry_文本_长小数;
 typedef struct { CsayStr key; CsayStr val; } CsayEntry_文本_文本;
 typedef struct { CsayStr key; CsayBool val; } CsayEntry_文本_真假;
 typedef struct { CsayInt key; CsayInt val; } CsayEntry_整数_整数;
-typedef struct { CsayInt key; CsayFloat val; } CsayEntry_整数_小数;
+typedef struct { CsayInt key; CsayFloat32 val; } CsayEntry_整数_浮点数;
+typedef struct { CsayInt key; CsayFloat val; } CsayEntry_整数_长小数;
 typedef struct { CsayInt key; CsayStr val; } CsayEntry_整数_文本;
 typedef struct { CsayInt key; CsayBool val; } CsayEntry_整数_真假;
+typedef struct { CsayBool key; CsayInt val; } CsayEntry_真假_整数;
+typedef struct { CsayBool key; CsayFloat32 val; } CsayEntry_真假_浮点数;
+typedef struct { CsayBool key; CsayFloat val; } CsayEntry_真假_长小数;
+typedef struct { CsayBool key; CsayStr val; } CsayEntry_真假_文本;
+typedef struct { CsayBool key; CsayBool val; } CsayEntry_真假_真假;
 
 static CsayList* csay_map_entries_文本_整数(CsayMap* m) {
     CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_文本_整数));
@@ -1703,11 +2841,23 @@ static CsayList* csay_map_entries_文本_整数(CsayMap* m) {
     return l;
 }
 
-static CsayList* csay_map_entries_文本_小数(CsayMap* m) {
-    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_文本_小数));
+static CsayList* csay_map_entries_文本_浮点数(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_文本_浮点数));
     for (int64_t i = 0; i < m->cap; i++) {
         if (!m->used[i]) continue;
-        CsayEntry_文本_小数 e;
+        CsayEntry_文本_浮点数 e;
+        memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayStr));
+        memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayFloat32));
+        csay_list_add(l, &e);
+    }
+    return l;
+}
+
+static CsayList* csay_map_entries_文本_长小数(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_文本_长小数));
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayEntry_文本_长小数 e;
         memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayStr));
         memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayFloat));
         csay_list_add(l, &e);
@@ -1751,11 +2901,23 @@ static CsayList* csay_map_entries_整数_整数(CsayMap* m) {
     return l;
 }
 
-static CsayList* csay_map_entries_整数_小数(CsayMap* m) {
-    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_整数_小数));
+static CsayList* csay_map_entries_整数_浮点数(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_整数_浮点数));
     for (int64_t i = 0; i < m->cap; i++) {
         if (!m->used[i]) continue;
-        CsayEntry_整数_小数 e;
+        CsayEntry_整数_浮点数 e;
+        memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayInt));
+        memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayFloat32));
+        csay_list_add(l, &e);
+    }
+    return l;
+}
+
+static CsayList* csay_map_entries_整数_长小数(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_整数_长小数));
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayEntry_整数_长小数 e;
         memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayInt));
         memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayFloat));
         csay_list_add(l, &e);
@@ -1787,12 +2949,145 @@ static CsayList* csay_map_entries_整数_真假(CsayMap* m) {
     return l;
 }
 
+static CsayList* csay_map_entries_真假_整数(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_真假_整数));
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayEntry_真假_整数 e;
+        memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayBool));
+        memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayInt));
+        csay_list_add(l, &e);
+    }
+    return l;
+}
+
+static CsayList* csay_map_entries_真假_浮点数(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_真假_浮点数));
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayEntry_真假_浮点数 e;
+        memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayBool));
+        memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayFloat32));
+        csay_list_add(l, &e);
+    }
+    return l;
+}
+
+static CsayList* csay_map_entries_真假_长小数(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_真假_长小数));
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayEntry_真假_长小数 e;
+        memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayBool));
+        memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayFloat));
+        csay_list_add(l, &e);
+    }
+    return l;
+}
+
+static CsayList* csay_map_entries_真假_文本(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_真假_文本));
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayEntry_真假_文本 e;
+        memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayBool));
+        memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayStr));
+        csay_list_add(l, &e);
+    }
+    return l;
+}
+
+static CsayList* csay_map_entries_真假_真假(CsayMap* m) {
+    CsayList* l = csay_list_new((int64_t)sizeof(CsayEntry_真假_真假));
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        CsayEntry_真假_真假 e;
+        memcpy(&e.key, m->keys + i * m->keySize, sizeof(CsayBool));
+        memcpy(&e.val, m->vals + i * m->valSize, sizeof(CsayBool));
+        csay_list_add(l, &e);
+    }
+    return l;
+}
+
+/* 按类型描述递归序列化。描述符只用 ASCII：
+   s/i/f/d/b 基本类型，l 列表，m 表（后跟键类型 s 或 i），
+   A 带长度头的数组（后跟元素描述）。 */
+static CsayStr csay_json_any(const void* v, int64_t n, int64_t elem, const char* d) {
+    char k = *d++;
+    if (k == 's') return csay_json_text(*(const CsayStr*)v);
+    if (k == 'c') return csay_json_text(csay_char_of_code(*(const CsayInt*)v));
+    if (k == 'i') return csay_str_of_int(*(const CsayInt*)v);
+    if (k == 'f') return csay_str_of_float32(*(const CsayFloat32*)v);
+    if (k == 'd') return csay_str_of_float(*(const CsayFloat*)v);
+    if (k == 'b') return csay_json_bool(*(const CsayBool*)v);
+    if (k == 'a') {
+        CsayStr out = csay_lit("[");
+        for (int64_t i = 0; i < n; i++) {
+            if (i > 0) out = csay_cat(out, csay_lit(","));
+            out = csay_cat(out, csay_json_any((const char*)v + i * elem, 0, 0, d));
+        }
+        return csay_cat(out, csay_lit("]"));
+    }
+    if (k == 'A') {
+        const void* p = *(void* const*)v;
+        if (p == NULL) return csay_lit("[]");
+        int64_t len = csay_array_len(p);
+        int64_t es = csay_array_elem(p);
+        CsayStr out = csay_lit("[");
+        for (int64_t i = 0; i < len; i++) {
+            if (i > 0) out = csay_cat(out, csay_lit(","));
+            out = csay_cat(out, csay_json_any((const char*)p + i * es, 0, 0, d));
+        }
+        return csay_cat(out, csay_lit("]"));
+    }
+    if (k == 'l') {
+        CsayList* l = *(CsayList* const*)v;
+        if (l == NULL) return csay_lit("null");
+        CsayStr out = csay_lit("[");
+        for (int64_t i = 0; i < l->len; i++) {
+            if (i > 0) out = csay_cat(out, csay_lit(","));
+            out = csay_cat(out, csay_json_any(csay_list_at(l, i), 0, 0, d));
+        }
+        return csay_cat(out, csay_lit("]"));
+    }
+    if (k == 'm') {
+        char keyKind = *d++;
+        CsayMap* m = *(CsayMap* const*)v;
+        if (m == NULL) return csay_lit("null");
+        CsayStr out = csay_lit("{");
+        int64_t written = 0;
+        for (int64_t i = 0; i < m->cap; i++) {
+            if (!m->used[i]) continue;
+            if (written++ > 0) out = csay_cat(out, csay_lit(","));
+            const void* kp = m->keys + i * m->keySize;
+            CsayStr key = keyKind == 's'
+                ? csay_json_text(*(const CsayStr*)kp)
+                : keyKind == 'b'
+                    ? csay_json_text(csay_str_of_bool(*(const CsayBool*)kp))
+                    : csay_json_text(csay_str_of_int(*(const CsayInt*)kp));
+            out = csay_cat(out, key);
+            out = csay_cat(out, csay_lit(":"));
+            out = csay_cat(out, csay_json_any(m->vals + i * m->valSize, 0, 0, d));
+        }
+        return csay_cat(out, csay_lit("}"));
+    }
+    return csay_lit("null");
+}
+
 /* ---------------- 文本切分 ---------------- */
 
 static CsayList* csay_split(CsayStr s, CsayStr sep) {
     CsayList* l = csay_list_new((int64_t)sizeof(CsayStr));
     if (sep.n == 0) {
-        csay_list_add(l, &s);
+        /* 空分隔符按 Unicode 码点切成单个字符，自举编译器用它避免 O(n²) 下标 */
+        int64_t i = 0;
+        while (i < s.n) {
+            int len = csay_utf8_seq_len((unsigned char)s.p[i]);
+            if (i + len > s.n) len = 1;
+            CsayStr part = csay_str(s.p + i, len);
+            csay_list_add(l, &part);
+            i += len;
+        }
         return l;
     }
     int64_t start = 0;
@@ -1844,7 +3139,26 @@ static CsayError csay_error(CsayStr msg, CsayInt kind) {
     CsayError e;
     e.msg = msg;
     e.kind = kind;
+    e.ok = 1;
     return e;
+}
+
+static CsayError csay_error_null(void) {
+    CsayError e;
+    e.msg = csay_lit("");
+    e.kind = 0;
+    e.ok = 0;
+    return e;
+}
+
+static CsayError csay_error_coalesce(CsayError a, CsayError b) {
+    return a.ok ? a : b;
+}
+
+static CsayInt csay_error_equal(CsayError a, CsayError b) {
+    if (a.ok != b.ok) return 0;
+    if (!a.ok) return 1;
+    return a.kind == b.kind && csay_str_eq(a.msg, b.msg);
 }
 
 static CsayStr csay_error_kind_name(CsayInt kind) {
@@ -1854,6 +3168,14 @@ static CsayStr csay_error_kind_name(CsayInt kind) {
     if (kind == CSAY_ERR_INDEX) return csay_lit("\xE8\xB6\x8A\xE7\x95\x8C\xE5\xBC\x82\xE5\xB8\xB8");
     if (kind == CSAY_ERR_FORMAT) return csay_lit("\xE6\xA0\xBC\xE5\xBC\x8F\xE5\xBC\x82\xE5\xB8\xB8");
     return csay_lit("\xE5\xBC\x82\xE5\xB8\xB8");
+}
+
+static CsayStr csay_error_ns_msg(CsayError e) {
+    return e.ok ? e.msg : csay_lit("");
+}
+
+static CsayStr csay_error_ns_kind(CsayError e) {
+    return e.ok ? csay_error_kind_name(e.kind) : csay_lit("");
 }
 
 static void csay_throw_error(CsayError e) {
@@ -1903,7 +3225,7 @@ static CsayStr csay_read_line(void) {
         if (ReadConsoleW(h, wbuf, 4095, &got, NULL)) {
             while (got > 0 && (wbuf[got - 1] == L'\n' || wbuf[got - 1] == L'\r')) got--;
             int bytes = WideCharToMultiByte(65001, 0, wbuf, (int)got, NULL, 0, NULL, NULL);
-            char* p = (char*)malloc((size_t)bytes + 1);
+            char* p = (char*)csay_alloc(bytes + 1);
             if (bytes > 0) WideCharToMultiByte(65001, 0, wbuf, (int)got, p, bytes, NULL, NULL);
             p[bytes] = 0;
             return csay_str(p, bytes);
@@ -1912,12 +3234,14 @@ static CsayStr csay_read_line(void) {
 #endif
     int64_t cap = 128;
     int64_t len = 0;
-    char* buf = (char*)malloc((size_t)cap);
+    char* buf = (char*)csay_alloc(cap);
     int c;
     while ((c = fgetc(stdin)) != EOF && c != '\n') {
         if (len + 1 >= cap) {
+            char* next = (char*)csay_alloc(cap * 2);
+            memcpy(next, buf, (size_t)len);
+            buf = next;
             cap *= 2;
-            buf = (char*)realloc(buf, (size_t)cap);
         }
         buf[len++] = (char)c;
     }
@@ -2014,6 +3338,10 @@ static CsayFloat csay_str_to_float(CsayStr s) {
     CsayFloat v = (CsayFloat)atof(p);
     free(p);
     return v;
+}
+
+static CsayFloat32 csay_str_to_float32(CsayStr s) {
+    return (CsayFloat32)csay_str_to_float(s);
 }
 
 static CsayBool csay_write_file(CsayStr path, CsayStr content) {

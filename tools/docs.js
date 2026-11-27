@@ -1,11 +1,11 @@
 (function () {
   'use strict';
 
-  var KW_T = ['整数', '小数', '文本', '真假', '字节', '无', '任意', '列表', '表', '条目', '异常'];
-  var KW_D = ['类', '结构', '接口', '枚举', '空间'];
-  var KW_M = ['公开', '私有', '保护', '内部', '静态', '只读', '抽象', '虚拟', '覆盖', '常'];
-  var KW_C = ['若', '否则若', '否则', '择', '情形', '默认', '对于', '遍历', '只要', '做', '在', '返回', '跳出', '跳过', '区域', '试', '捕获', '最终', '抛出', '引'];
-  var KW_X = ['新', '空', '真', '假', '自', '基', '取', '写', '值'];
+  var KW_T = ['整数', '浮点数', '长小数', '文本', '真假', '无', '列表', '表', '条目', '异常'];
+  var KW_D = ['类', '结构', '接口', '枚举', '委托', '命名空间'];
+  var KW_M = ['公开', '私有', '保护', '内部', '静态', '只读', '抽象', '虚拟', '覆盖', '常', '密封'];
+  var KW_C = ['若', '否则若', '否则', '选择', '情况', '默认', '循环', '遍历', '只要', '做', '在', '返回', '跳出', '跳过', '区域', '使用', '试', '捕获', '最终', '抛出', '引'];
+  var KW_X = ['新', '空', '真', '假', '自', '基', '取', '写', '值', '字节', '任意'];
 
   function escHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -238,20 +238,43 @@
   }, { passive: true });
   refreshSectionSpy();
 
-  // 目录滚动位置：刷新页面后仍停在上次的位置
+  // 目录滚动：加载和切换章节时把当前项放在目录高度的 38.2% 附近
   var sidebar = document.getElementById('sidebar');
-  var SIDEBAR_SCROLL_KEY = 'csay-docs-sidebar-scroll';
-  if (sidebar) {
-    try {
-      var savedSide = Number(sessionStorage.getItem(SIDEBAR_SCROLL_KEY) || 0);
-      if (savedSide > 0) sidebar.scrollTop = savedSide;
-    } catch (e) {}
-    sidebar.addEventListener('scroll', function () {
-      try { sessionStorage.setItem(SIDEBAR_SCROLL_KEY, String(sidebar.scrollTop)); } catch (e) {}
-    }, { passive: true });
+  var SIDEBAR_ANCHOR = 0.382;
+
+  function scrollSidebarToItem(active, behavior) {
+    if (!sidebar || !active) return;
+    var box = sidebar.getBoundingClientRect();
+    var rect = active.getBoundingClientRect();
+    var target = sidebar.scrollTop + (rect.top - box.top) - box.height * SIDEBAR_ANCHOR + rect.height / 2;
+    var max = sidebar.scrollHeight - sidebar.clientHeight;
+    target = Math.max(0, Math.min(max, target));
+    if (behavior === false) sidebar.scrollTop = target;
+    else sidebar.scrollTo({ top: target, behavior: 'smooth' });
   }
 
-  // 章节链接不整页刷新：只替换正文和目录，保留目录滚动位置
+  function scrollSidebarToCurrent(behavior) {
+    if (!sidebar) return;
+    scrollSidebarToItem(sidebar.querySelector('.side-sec.on') || sidebar.querySelector('.side-link.on'), behavior);
+  }
+
+  function sidebarSectionLink(id) {
+    if (!sidebar) return null;
+    var links = sidebar.querySelectorAll('.side-sec');
+    for (var i = 0; i < links.length; i++) {
+      if (links[i].getAttribute('data-sec') === id) return links[i];
+    }
+    return null;
+  }
+
+  if (sidebar) {
+    requestAnimationFrame(function () {
+      var hashId = location.hash ? decodeURIComponent(location.hash.slice(1)) : '';
+      scrollSidebarToItem(sidebarSectionLink(hashId) || sidebar.querySelector('.side-sec.on') || sidebar.querySelector('.side-link.on'), false);
+    });
+  }
+
+  // 章节链接不整页刷新：只替换正文和目录
   function isDocsUrl(url) {
     return url.origin === location.origin && (url.pathname === '/docs' || url.pathname.indexOf('/docs/') === 0);
   }
@@ -260,14 +283,27 @@
     var target = new URL(url, location.href);
     if (!isDocsUrl(target)) { location.href = target.href; return; }
     if (target.pathname === location.pathname && target.hash) {
-      var same = document.querySelector(target.hash);
-      if (same) same.scrollIntoView();
+      var id = decodeURIComponent(target.hash.slice(1));
+      var same = document.getElementById(id);
+      if (same) {
+        same.scrollIntoView();
+        if (push) history.pushState({}, '', target.pathname + target.search + target.hash);
+        requestAnimationFrame(function () {
+          updateSectionSpy();
+          scrollSidebarToItem(sidebarSectionLink(id) || sidebar.querySelector('.side-sec.on') || sidebar.querySelector('.side-link.on'));
+        });
+      }
       return;
     }
-    if (target.pathname === location.pathname && !target.hash) return;
+    if (target.pathname === location.pathname && !target.hash) {
+      window.scrollTo(0, 0);
+      requestAnimationFrame(function () {
+        updateSectionSpy();
+        scrollSidebarToCurrent();
+      });
+      return;
+    }
 
-    var oldSidebar = document.getElementById('sidebar');
-    var oldScroll = oldSidebar ? oldSidebar.scrollTop : 0;
     fetch(target.pathname + target.search, { credentials: 'same-origin' })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -284,8 +320,6 @@
         var currentSidebar = document.getElementById('sidebar');
         if (nextSidebar && currentSidebar) {
           currentSidebar.innerHTML = nextSidebar.innerHTML;
-          currentSidebar.scrollTop = oldScroll;
-          try { sessionStorage.setItem(SIDEBAR_SCROLL_KEY, String(oldScroll)); } catch (e) {}
         }
 
         document.title = parsed.title || document.title;
@@ -294,7 +328,7 @@
         if (nextTitle && currentTitle) currentTitle.textContent = nextTitle.textContent;
         if (push) history.pushState({}, '', target.pathname + target.search + target.hash);
         if (target.hash) {
-          var anchor = document.querySelector(target.hash);
+          var anchor = document.getElementById(decodeURIComponent(target.hash.slice(1)));
           if (anchor) anchor.scrollIntoView();
           else window.scrollTo(0, 0);
         } else {
@@ -303,6 +337,11 @@
         setupDemos(currentMain);
         refreshSectionSpy();
         filterSidebar();
+        requestAnimationFrame(function () {
+          var link = target.hash ? sidebarSectionLink(decodeURIComponent(target.hash.slice(1))) : null;
+          if (link) scrollSidebarToItem(link);
+          else scrollSidebarToCurrent();
+        });
         document.body.classList.remove('side-open');
       })
       .catch(function () { location.href = target.href; });
@@ -315,7 +354,7 @@
     var links = document.querySelectorAll('.side-link');
     for (var i = 0; i < links.length; i++) {
       var link = links[i];
-      var chapterText = (link.textContent || '').toLowerCase();
+      var chapterText = ((link.textContent || '') + ' ' + (link.getAttribute('data-search') || '')).toLowerCase();
       var chapterMatch = !q || chapterText.indexOf(q) >= 0;
       var sections = link.nextElementSibling;
       var hasSection = sections && sections.className === 'side-sections';
@@ -343,7 +382,7 @@
     while (a && a.tagName !== 'A') a = a.parentNode;
     if (!a || !a.getAttribute) return;
     var href = a.getAttribute('href');
-    if (!href || href.charAt(0) === '#' || a.target === '_blank') return;
+    if (!href || a.target === '_blank') return;
     if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
     var url = new URL(a.href, location.href);
     if (!isDocsUrl(url)) return;

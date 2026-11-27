@@ -306,7 +306,17 @@ h4:hover .anchor { opacity: 1; }
 .doc-body strong { color: var(--text-strong); }
 
 .doc-list { margin: 10px 0 16px; padding-left: 26px; }
-.doc-list li { margin: 5px 0; }
+.doc-list li {
+  margin: 5px 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.doc-list li code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .doc-list li::marker { color: var(--accent-dim); }
 
 hr { border: 0; border-top: 1px solid var(--border); margin: 34px 0; }

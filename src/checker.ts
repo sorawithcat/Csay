@@ -77,6 +77,8 @@ function checkExpr(e: Expr, scope: Set<string>, ctx: Ctx): void {
       }
       for (const a of e.args) checkExpr(a, scope, ctx)
       return
+    case 'named': checkExpr(e.value, scope, ctx); return
+    case 'byref': checkExpr(e.expr, scope, ctx); return
     case 'member':
       // 成员名不是作用域引用，只检查接收者
       checkExpr(e.target, scope, ctx); return
@@ -231,21 +233,15 @@ export function checkNames(unit: CompilationUnit, extraNames: Iterable<string> =
   const ctx: Ctx = { diags: [], reported: new Set() }
   const globals = new Set<string>(extraNames)
 
-  for (const d of unit.decls) {
-    switch (d.kind) {
-      case 'class': case 'struct': case 'interface': case 'enum': case 'delegate':
-        globals.add(d.name)
-        break
-      case 'namespace':
-        for (const inner of d.decls) {
-          if (inner.kind === 'class' || inner.kind === 'struct' || inner.kind === 'interface' || inner.kind === 'enum' || inner.kind === 'delegate') {
-            globals.add(inner.name)
-          }
-        }
-        break
-      default: break
+  const addGlobals = (decls: Decl[]): void => {
+    for (const d of decls) {
+      if (d.kind === 'namespace') {
+        for (const part of d.name.split('.')) globals.add(part)
+        addGlobals(d.decls)
+      } else if (d.kind === 'class' || d.kind === 'struct' || d.kind === 'interface' || d.kind === 'enum' || d.kind === 'delegate') globals.add(d.name)
     }
   }
+  addGlobals(unit.decls)
 
   const topScope = new Set(globals)
   collectNames(unit.stmts, topScope)

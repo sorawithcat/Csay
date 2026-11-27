@@ -8,7 +8,11 @@ import type {
   Accessor, CaseClause, CatchClause, EnumItem, StringSeg,
 } from './ast.ts'
 
-const PRIMITIVE_TYPES = new Set(['整数', '小数', '文本', '真假', '字节', '无', '任意'])
+const PRIMITIVE_TYPES = new Set([
+  '字节', '有符号字节', '短整数', '无符号短整数',
+  '整数', '无符号整数', '长整数', '无符号长整数',
+  '浮点数', '长小数', '文本', '字符', '真假', '无',
+])
 const MODIFIERS = new Set<Modifier>([
   '公开', '私有', '保护', '内部', '静态', '只读', '抽象', '虚拟', '覆盖', '常', '密封',
 ])
@@ -129,18 +133,16 @@ export class Parser {
       this.endStmt()
     }
 
-    // 顶层语句：对应 C# 9 的 top-level statements，必须写在所有类型声明之前
+    // 顶层语句和类型声明可以交错；编译时顶层语句仍会被包进隐式 主()。
     const stmts: Stmt[] = []
-    while (!this.atEof() && !this.isDeclStart()) {
-      stmts.push(this.parseStmt())
-    }
-
     const decls: Decl[] = []
     while (!this.atEof()) {
-      if (this.at('空间')) {
+      if (this.at('命名空间')) {
         decls.push(this.parseNamespace())
-      } else {
+      } else if (this.isDeclStart()) {
         decls.push(this.parseDecl())
+      } else {
+        stmts.push(this.parseStmt())
       }
     }
     return { usings, stmts, decls }
@@ -149,7 +151,7 @@ export class Parser {
   /** 顶层是否已进入类型声明区 */
   private isDeclStart(): boolean {
     const t = this.peek()
-    if (t.text === '空间' || t.text === '类' || t.text === '结构' || t.text === '接口' || t.text === '枚举' || t.text === '委托') {
+    if (t.text === '命名空间' || t.text === '类' || t.text === '结构' || t.text === '接口' || t.text === '枚举' || t.text === '委托') {
       return true
     }
     return t.kind === 'keyword' && MODIFIERS.has(t.text as Modifier)
@@ -182,14 +184,15 @@ export class Parser {
   private parseDecl(): Decl {
     const mods = this.parseModifiers()
     const t = this.peek()
+    if (t.text === '命名空间') return this.parseNamespace()
     if (t.text === '类' || t.text === '结构' || t.text === '接口') {
       return this.parseClassLike(mods)
     }
     if (t.text === '枚举') return this.parseEnum(mods)
     if (t.text === '委托') return this.parseDelegate(mods)
     const found = t.kind === 'eof' ? '文件结尾' : `「${t.text}」`
-    throw this.err(`这里应该是一个类型声明（类 / 结构 / 接口 / 枚举 / 委托），读到${found}`,
-      '顶层语句必须写在所有类型声明之前，和 C# 的顶层语句规则一致')
+    throw this.err(`这里应该是一个声明或语句，读到${found}`,
+      '顶层语句和类型声明可以按任意顺序书写')
   }
 
   private parseDelegate(mods: Modifier[]): Decl {
@@ -215,9 +218,16 @@ export class Parser {
     const kind = kw.text === '类' ? 'class' : kw.text === '结构' ? 'struct' : 'interface'
     const name = this.expectIdent('类型名')
     const typeParams: string[] = []
+    const typeConstraints: Record<string, TypeRef[]> = {}
     if (this.eat('<')) {
       do {
-        typeParams.push(this.expectIdent('类型参数名'))
+        const p = this.expectIdent('类型参数名')
+        typeParams.push(p)
+        if (this.eat(':')) {
+          const cs = [this.parseType()]
+          while (this.eat('&')) cs.push(this.parseType())
+          typeConstraints[p] = cs
+        }
       } while (this.eat(','))
       this.expect('>', '类型参数表少了一个右尖括号「>」')
     }
@@ -245,7 +255,7 @@ export class Parser {
     }
     return {
       kind: kind as 'class' | 'struct' | 'interface',
-      modifiers: mods, name, typeParams, bases, members,
+      modifiers: mods, name, typeParams, typeConstraints, bases, members,
       line: kw.line, col: kw.col,
     }
   }
@@ -292,16 +302,27 @@ export class Parser {
           throw this.err('构造器后面只能写「: 基(...)」来调用父类构造器')
         }
       }
-      const body = mods.includes('抽象') && this.at(';') ? (this.next(), null) : this.parseBlock()
+      let body: Stmt | null
+      let exprBody: Expr | null = null
+      if (mods.includes('抽象') && this.at(';')) {
+        this.next()
+        body = null
+      } else if (this.at('=>')) {
+        const eb = this.parseExpressionBody(null)
+        body = eb.body
+        exprBody = eb.expr
+      } else {
+        body = this.parseBlock()
+      }
       if (mods.includes('抽象') && body !== null) throw this.err('抽象方法不能有方法体')
       if (isCtor) {
-        return { kind: 'ctor', modifiers: mods, name, params, baseArgs, body, line: t.line, col: t.col }
+        return { kind: 'ctor', modifiers: mods, name, params, baseArgs, body, exprBody, line: t.line, col: t.col }
       }
       // 省略返回类型的方法：返回 无
       return {
         kind: 'method', modifiers: mods,
         ret: { kind: 'named', name: '无', typeArgs: [] },
-        name, params, body, line: t.line, col: t.col,
+        name, params, body, exprBody, line: t.line, col: t.col,
       }
     }
 
@@ -310,9 +331,27 @@ export class Parser {
 
     if (this.at('(')) {
       const params = this.parseParamList()
-      const body = mods.includes('抽象') && this.at(';') ? (this.next(), null) : this.parseBlock()
+      let body: Stmt | null
+      let exprBody: Expr | null = null
+      if (mods.includes('抽象') && this.at(';')) {
+        this.next()
+        body = null
+      } else if (this.at('=>')) {
+        const eb = this.parseExpressionBody(type)
+        body = eb.body
+        exprBody = eb.expr
+      } else {
+        body = this.parseBlock()
+      }
       if (mods.includes('抽象') && body !== null) throw this.err('抽象方法不能有方法体')
-      return { kind: 'method', modifiers: mods, ret: type, name, params, body, line: t.line, col: t.col }
+      return { kind: 'method', modifiers: mods, ret: type, name, params, body, exprBody, line: t.line, col: t.col }
+    }
+    if (this.at('=>')) {
+      const eb = this.parseExpressionBody(type)
+      return {
+        kind: 'prop', modifiers: mods, type, name,
+        accessors: [{ kind: 'get', body: eb.body }], exprBody: eb.expr, line: t.line, col: t.col,
+      }
     }
     if (this.at('{')) {
       const accessors = this.parseAccessors()
@@ -322,6 +361,17 @@ export class Parser {
     if (this.eat('=')) init = this.parseExpr()
     this.endStmt()
     return { kind: 'field', modifiers: mods, type, name, init, line: t.line, col: t.col }
+  }
+
+  private parseExpressionBody(type: TypeRef | null): { body: Stmt; expr: Expr } {
+    this.expect('=>', '表达式体成员需要 =>')
+    const expr = this.parseExpr()
+    this.endStmt()
+    const isVoid = type === null || (type.kind === 'named' && type.name === '无')
+    const inner: Stmt = isVoid
+      ? { kind: 'expr', expr, line: expr.line, col: expr.col }
+      : { kind: 'return', value: expr, line: expr.line, col: expr.col }
+    return { body: { kind: 'block', stmts: [inner], line: expr.line, col: expr.col }, expr }
   }
 
   private parseInterfaceMember(): Member {
@@ -379,11 +429,15 @@ export class Parser {
     const out: Param[] = []
     if (!this.at(')')) {
       do {
+        let mode: 'ref' | 'out' | undefined
+        if (this.at('引用') || this.at('输出')) {
+          mode = this.next().text === '引用' ? 'ref' : 'out'
+        }
         const type = this.parseType()
         const name = this.expectIdent('参数名')
         let def: Expr | null = null
         if (this.eat('=')) def = this.parseExpr()
-        out.push({ type, name, def })
+        out.push({ type, name, def, mode })
       } while (this.eat(','))
     }
     this.expect(')', '参数表少了一个右括号')
@@ -410,7 +464,7 @@ export class Parser {
     if (t.kind !== 'ident' && !isPrim) {
       const found = t.kind === 'eof' ? '文件结尾' : `「${t.text}」`
       throw this.err(`这里需要一个类型，但读到的是${found}`,
-        '类型可以写 整数、小数、文本、真假，或者你自己定义的类型名')
+        '类型可以写 整数、长整数、字节、浮点数、长小数、文本、真假，或者你自己定义的类型名')
     }
     this.next()
     let name = t.text
@@ -446,9 +500,9 @@ export class Parser {
       case '若': return this.parseIf()
       case '只要': return this.parseWhile()
       case '做': return this.parseDoWhile()
-      case '对于': return this.parseFor()
+      case '循环': return this.parseFor()
       case '遍历': return this.parseForEach()
-      case '择': return this.parseSwitch()
+      case '选择': return this.parseSwitch()
       case '试': return this.parseTry()
       case '区域': {
         this.next()
@@ -563,6 +617,11 @@ export class Parser {
     const name = this.expectIdent('变量名')
     let init: Expr | null = null
     if (this.eat('=')) init = this.parseExpr()
+    if (type.kind === 'named' && type.typeArgs.length === 0 && init !== null &&
+        init.kind === 'new' && init.type.kind === 'named' &&
+        init.type.name === type.name && init.type.typeArgs.length > 0) {
+      type.typeArgs = init.type.typeArgs
+    }
     return { kind: 'var', type, name, init, line: t.line, col: t.col }
   }
 
@@ -630,7 +689,7 @@ export class Parser {
 
   private parseFor(): Stmt {
     const t = this.next()
-    this.expect('(', '对于 后面的三段要写在括号里')
+    this.expect('(', '循环 后面的三段要写在括号里')
     let init: Stmt | null = null
     if (!this.at(';')) {
       if (this.looksLikeVarDecl()) init = this.parseVarDeclCore()
@@ -639,17 +698,17 @@ export class Parser {
         init = { kind: 'expr', expr: e, line: e.line, col: e.col }
       }
     }
-    this.expect(';', '对于 的第一段后面需要分号')
+    this.expect(';', '循环 的第一段后面需要分号')
     let cond: Expr | null = null
     if (!this.at(';')) cond = this.parseExpr()
-    this.expect(';', '对于 的第二段后面需要分号')
+    this.expect(';', '循环 的第二段后面需要分号')
     const step: Expr[] = []
     if (!this.at(')')) {
       do {
         step.push(this.parseExpr())
       } while (this.eat(','))
     }
-    this.expect(')', '对于 的括号没有闭合')
+    this.expect(')', '循环 的括号没有闭合')
     const body = this.parseBody()
     return { kind: 'for', init, cond, step, body, line: t.line, col: t.col }
   }
@@ -682,19 +741,20 @@ export class Parser {
 
   private parseSwitch(): Stmt {
     const t = this.next()
-    this.expect('(', '择 后面要写 (被判断的值)')
+    this.expect('(', '选择 后面要写 (被判断的值)')
     const subject = this.parseExpr()
-    this.expect(')', '择 的括号没有闭合')
-    this.expect('{', '择 后面需要一个左花括号')
+    this.expect(')', '选择 的括号没有闭合')
+    this.expect('{', '选择 后面需要一个左花括号')
     const clauses: CaseClause[] = []
+    const atCase = (): boolean => this.at('情况')
     while (!this.at('}') && !this.atEof()) {
       const c = this.peek()
-      if (this.at('情形')) {
+      if (atCase()) {
         this.next()
         const label = this.parseExpr()
-        this.expect(':', '情形 后面需要冒号「:」')
+        this.expect(':', '情况 后面需要冒号「:」')
         const stmts: Stmt[] = []
-        while (!this.at('情形') && !this.at('默认') && !this.at('}') && !this.atEof()) {
+        while (!atCase() && !this.at('默认') && !this.at('}') && !this.atEof()) {
           stmts.push(this.parseStmt())
         }
         clauses.push({ label, stmts, line: c.line, col: c.col })
@@ -702,16 +762,16 @@ export class Parser {
         this.next()
         this.expect(':', '默认 后面需要冒号「:」')
         const stmts: Stmt[] = []
-        while (!this.at('情形') && !this.at('默认') && !this.at('}') && !this.atEof()) {
+        while (!atCase() && !this.at('默认') && !this.at('}') && !this.atEof()) {
           stmts.push(this.parseStmt())
         }
         clauses.push({ label: null, stmts, line: c.line, col: c.col })
       } else {
-        throw this.err('择 里面只能写「情形 值:」或「默认:」',
+        throw this.err('选择 里面只能写「情况 值:」或「默认:」',
           `读到的是「${this.peek().text}」`)
       }
     }
-    this.expect('}', '择 少了一个右花括号')
+    this.expect('}', '选择 少了一个右花括号')
     return { kind: 'switch', subject, clauses, line: t.line, col: t.col }
   }
 
@@ -725,7 +785,12 @@ export class Parser {
       const type = this.parseType()
       const name = this.expectIdent('异常变量名')
       this.expect(')', '捕获 的括号没有闭合')
-      catches.push({ type, name, body: this.parseBlock() })
+      let filter: Expr | null = null
+      if (this.at('若')) {
+        this.next()
+        filter = this.parseExpr()
+      }
+      catches.push({ type, name, filter, body: this.parseBlock() })
     }
     let fin: Stmt | null = null
     if (this.at('最终')) {
@@ -756,7 +821,7 @@ export class Parser {
   }
 
   private parseCond(): Expr {
-    const cond = this.parseOr()
+    const cond = this.parseCoalesce()
     if (this.at('?')) {
       const t = this.next()
       const then = this.parseExpr()
@@ -765,6 +830,16 @@ export class Parser {
       return { kind: 'cond', cond, then, else: els, line: t.line, col: t.col }
     }
     return cond
+  }
+
+  private parseCoalesce(): Expr {
+    let left = this.parseOr()
+    while (this.at('??')) {
+      const t = this.next()
+      const right = this.parseCoalesce()
+      left = { kind: 'binary', op: t.text, left, right, line: left.line, col: left.col }
+    }
+    return left
   }
 
   private binaryLevel(nextLevel: () => Expr, ops: Set<string>): Expr {
@@ -823,10 +898,11 @@ export class Parser {
         e = { kind: 'call', callee: e, args, line: e.line, col: e.col }
         continue
       }
-      if (this.at('.')) {
+      if (this.at('.') || this.at('?.')) {
+        const nullSafe = this.at('?.')
         this.next()
         const name = this.expectIdent('成员名')
-        e = { kind: 'member', target: e, name, line: e.line, col: e.col }
+        e = { kind: 'member', target: e, name, nullSafe, line: e.line, col: e.col }
         continue
       }
       if (this.at('[')) {
@@ -850,15 +926,28 @@ export class Parser {
     const out: Expr[] = []
     if (!this.at(')')) {
       do {
-        out.push(this.parseExpr())
+        const t = this.peek()
+        const after = this.peek(1)
+        const modeArg = (this.at('引用') || this.at('输出')) && (after.kind === 'ident' || after.text === '自' || after.text === '基')
+        if (modeArg) {
+          const mode = this.next().text === '引用' ? 'ref' : 'out'
+          const value = this.parseExpr()
+          out.push({ kind: 'byref', mode, expr: value, line: t.line, col: t.col })
+        } else if (t.kind === 'ident' && this.peek(1).text === ':') {
+          this.next()
+          this.next()
+          const value = this.parseExpr()
+          out.push({ kind: 'named', name: t.text, value, line: t.line, col: t.col })
+        } else {
+          out.push(this.parseExpr())
+        }
       } while (this.eat(','))
     }
     return out
   }
 
   /** 从当前位置的 ( 扫到匹配的 )，后面是否紧跟 => */
-  private looksLikeLambda(): boolean {
-    let depth = 0
+  private looksLikeLambda(): boolean {    let depth = 0
     for (let i = this.pos; i < this.tokens.length; i++) {
       const t = this.tokens[i]
       if (t.kind === 'eof') return false
@@ -887,6 +976,30 @@ export class Parser {
     return { kind: 'lambda', params, body, line: open.line, col: open.col }
   }
 
+  private looksLikeCast(): boolean {
+    if (!this.at('(')) return false
+    let close = -1
+    for (let i = this.pos + 1; i < this.tokens.length; i++) {
+      if (this.tokens[i].text === ')') {
+        close = i
+        break
+      }
+    }
+    if (close < 0 || close === this.pos + 1) return false
+    const typeTokens = this.tokens.slice(this.pos + 1, close)
+    if (typeTokens.some((t) => ['+', '-', '*', '/', '%', '=', ',', ';', '?', ':', '??'].includes(t.text))) return false
+    if (typeTokens.some((t) => t.kind === 'op' && !['.', '<', '>', ',', '[', ']'].includes(t.text))) return false
+    const after = this.tokens[close + 1]
+    if (after === undefined) return false
+    if (after.text === '[' && !typeTokens.some((t) => t.text === '[')) return false
+    if (after.kind === 'int' || after.kind === 'float' || after.kind === 'string') return true
+    if (['(', '[', '新', '真', '假', '空', '自', '基'].includes(after.text)) return true
+    if (after.kind === 'ident') return true
+    if (after.text === '-' || after.text === '!') {
+      return ['整数', '长整数', '长小数', '浮点数', '文本', '真假', '字节', '有符号字节', '短整数', '无符号短整数', '无符号整数', '无符号长整数', '字符', '十进制'].includes(typeTokens[0]?.text ?? '')    }
+    return false
+  }
+
   private parsePrimary(): Expr {
     const t = this.peek()
 
@@ -898,6 +1011,10 @@ export class Parser {
       this.next()
       return { kind: 'float', text: t.text, line: t.line, col: t.col }
     }
+    if (t.kind === 'char') {
+      this.next()
+      return { kind: 'char', value: t.text.codePointAt(0) ?? 0, line: t.line, col: t.col }
+    }
     if (t.kind === 'string') {
       this.next()
       return this.stringExpr(t)
@@ -905,6 +1022,10 @@ export class Parser {
     if (t.text === '真' || t.text === '假') {
       this.next()
       return { kind: 'bool', value: t.text === '真', line: t.line, col: t.col }
+    }
+    if (t.text === '字符' && this.peek(1).text === '(') {
+      this.next()
+      return { kind: 'name', name: '字符', line: t.line, col: t.col }
     }
     if (t.text === '空') {
       this.next()
@@ -928,6 +1049,13 @@ export class Parser {
     }
     if (t.text === '(') {
       if (this.looksLikeLambda()) return this.parseLambda()
+      if (this.looksLikeCast()) {
+        const open = this.next()
+        const type = this.parseType()
+        this.expect(')', '类型转换少了一个右括号')
+        const expr = this.parseUnary()
+        return { kind: 'cast', type, expr, line: open.line, col: open.col }
+      }
       const open = this.next()
       const inner = this.parseExpr()
       this.expect(')', '括号没有闭合')

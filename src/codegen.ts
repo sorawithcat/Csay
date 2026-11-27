@@ -1,6 +1,6 @@
 // Csay 代码生成器：AST → C 源码。
 // 类型用字符串编码，避免引入庞大的联合类型：
-//   基本类型  整数 / 小数 / 文本 / 真假 / 无
+//   基本类型  整数 / 浮点数 / 长小数 / 文本 / 真假 / 无
 //   数组      整数[] 等
 //   对象      类:点 / 结构:点
 //   枚举      枚举:星期
@@ -10,6 +10,7 @@
 
 import { Buffer } from 'node:buffer'
 import type { CompilationUnit, Stmt, Expr, TypeRef, Param, Accessor, Decl } from './ast.ts'
+import { arrangeArguments } from './arguments.ts'
 import { RUNTIME_C } from './runtime.ts'
 import { expandGenerics } from './generics.ts'
 
@@ -17,8 +18,30 @@ export class Unsupported extends Error {}
 
 type CType = string
 
+function minArgsOf(params: Param[]): number {
+  const i = params.findIndex((p) => p.def !== null)
+  return i < 0 ? params.length : i
+}
+
 const PRIM: Record<string, CType> = {
-  '整数': '整数', '小数': '小数', '文本': '文本', '真假': '真假', '无': '无',
+  '字节': '字节', '有符号字节': '有符号字节',
+  '短整数': '短整数', '无符号短整数': '无符号短整数',
+  '整数': '整数', '无符号整数': '无符号整数',
+  '长整数': '长整数', '无符号长整数': '无符号长整数',
+  '浮点数': '浮点数', '长小数': '长小数',
+  '文本': '文本', '字符': '字符', '真假': '真假', '无': '无',
+}
+
+const INT_CASTS: Record<string, string> = {
+  '字节': 'uint8_t', '有符号字节': 'int8_t',
+  '短整数': 'int16_t', '无符号短整数': 'uint16_t',
+  '整数': 'int32_t', '无符号整数': 'uint32_t',
+  '长整数': 'int64_t', '无符号长整数': 'uint64_t',
+  '字符': 'uint16_t',
+}
+
+function isIntegerType(t: CType): boolean {
+  return INT_CASTS[t] !== undefined
 }
 
 const ERROR_KINDS: Record<string, number> = {
@@ -35,17 +58,17 @@ function errorKindOf(t: CType): number {
 
 type Visibility = '公开' | '私有' | '保护' | '内部'
 
-interface FieldInfo { name: string; cn: string; type: CType; vis: Visibility; isPrivate: boolean; isReadonly: boolean; isStatic: boolean; init: Expr | null }
+interface FieldInfo { name: string; cn: string; type: CType; vis: Visibility; isPrivate: boolean; isReadonly: boolean; isConst: boolean; isStatic: boolean; init: Expr | null; constC: string | null }
 interface MethodInfo {
-  name: string; cn: string; ret: CType; params: CType[]; isStatic: boolean; vis: Visibility; isPrivate: boolean; raw: any
+  name: string; cn: string; ret: CType; params: CType[]; defaults: (Expr | null)[]; modes: ('ref' | 'out' | null)[]; minArgs: number; isStatic: boolean; vis: Visibility; isPrivate: boolean; raw: any
 }
 interface PropInfo {
-  name: string; type: CType; getCn: string | null; setCn: string | null; vis: Visibility; isPrivate: boolean; raw: any
+  name: string; type: CType; getCn: string | null; setCn: string | null; vis: Visibility; isPrivate: boolean; isStatic: boolean; raw: any
 }
-interface CtorInfo { cn: string; initCn: string; params: CType[]; raw: any }
-interface IfaceMethod { name: string; cn: string; ret: CType; params: CType[] }
+interface CtorInfo { cn: string; initCn: string; params: CType[]; defaults: (Expr | null)[]; modes: ('ref' | 'out' | null)[]; minArgs: number; vis: Visibility; raw: any }
+interface IfaceMethod { name: string; cn: string; ret: CType; params: CType[]; modes: ('ref' | 'out' | null)[]; defaults: (Expr | null)[]; minArgs: number; paramNames: string[] }
 interface IfaceProp { name: string; type: CType; hasGet: boolean; hasSet: boolean }
-interface DelegateInfo { name: string; cn: string; params: CType[]; ret: CType; raw: any }
+interface DelegateInfo { name: string; cn: string; params: CType[]; ret: CType; raw: any; paramNames: string[] }
 interface TypeInfo {
   kind: 'class' | 'struct' | 'interface' | 'enum'
   name: string
@@ -75,7 +98,7 @@ function strLit(s: string): string {
   return `csay_str("${esc}", ${bytes.length})`
 }
 
-interface Value { c: string; t: CType; env?: string }
+interface Value { c: string; t: CType; env?: string; direct?: boolean }
 
 /** 收集 Lambda 体内引用到的名字，用于按值捕获外层局部变量。 */
 function collectNameRefs(node: unknown, out: Set<string>): void {
@@ -93,7 +116,7 @@ function collectNameRefs(node: unknown, out: Set<string>): void {
   }
 }
 
-/** 空间只做声明分组，编译时展开为同一作用域的声明。 */
+/** 命名空间只做声明分组，编译时展开为同一作用域的声明。 */
 function flattenDecls(decls: Decl[]): Decl[] {  const out: Decl[] = []
   for (const d of decls) {
     if (d.kind === 'namespace') out.push(...flattenDecls(d.decls))
@@ -102,19 +125,24 @@ function flattenDecls(decls: Decl[]): Decl[] {  const out: Decl[] = []
   return out
 }
 
+interface FuncInfo { cn: string; ret: CType; params: CType[]; defaults: (Expr | null)[]; minArgs: number; paramNames: string[]; modes: ('ref' | 'out' | null)[] }
+
 export class CodeGen {
   private out: string[] = []
   private names = new Map<string, string>()
   private counter = 0
   private scopes: Map<string, CType>[] = [new Map()]
-  private funcs = new Map<string, { cn: string; ret: CType; params: CType[] }>()
+  private funcs = new Map<string, FuncInfo[]>()
+  private refNames = new Map<string, string>()
   private types = new Map<string, TypeInfo>()
+  /** 命名空间限定的类型名（A.B.C）→ 实际类型名。 */
+  private typeAliases = new Map<string, string>()
   private delegates = new Map<string, DelegateInfo>()
   private delegateOrder: DelegateInfo[] = []
   private lambdaProtos: string[] = []
   private lambdaBodies: string[] = []
   private lambdaCounter = 0
-  private lambdaVoidBlock = false
+  private lambdaBlockRet: CType | null = null
   private file: string
   private debug: boolean
   private indent = 0
@@ -127,10 +155,12 @@ export class CodeGen {
    * loopDepth 记录进入区域时处在第几层循环，用来判断跳出是否真的离开了它。
    */
   private regionStack: { id: string; loopDepth: number }[] = []
+  /** 当前嵌套的 使用 块；提前返回/跳出时要先调用对应的 关闭()。 */
+  private usingStack: { close: string; closed: string; loopDepth: number }[] = []
   private usingDepth = 0
   private loopDepth = 0
   /** 当前正在生成的方法所属的类，方法表供裸调用同类方法使用 */
-  private classMethods: Map<string, { ret: CType; params: CType[]; cn: string }> | null = null
+  private classMethods: Map<string, { name: string; ret: CType; params: CType[]; defaults: (Expr | null)[]; modes: ('ref' | 'out' | null)[]; minArgs: number; cn: string; paramNames: string[] }[]> | null = null
   /** 顶层变量提升成 C 全局变量，函数里可以读写 */
   private globalNames = new Set<string>()
 
@@ -150,6 +180,8 @@ export class CodeGen {
   }
 
   private cname(cn: string): string {
+    const ref = this.refNames.get(cn)
+    if (ref !== undefined) return ref
     let v = this.names.get(cn)
     if (v === undefined) {
       v = 'n' + this.counter++
@@ -177,6 +209,8 @@ export class CodeGen {
 
   private resolveType(t: TypeRef): CType {
     if (t.kind === 'array') return `${this.resolveType(t.elem)}[]`
+    const alias = this.typeAliases.get(t.name)
+    if (alias !== undefined && t.typeArgs.length === 0) return alias
     if (t.name === '列表' || t.name === '集合' || t.name === '队列' || t.name === '栈') {
       if (t.typeArgs.length !== 1) throw new Unsupported(`${t.name} 需要 1 个类型参数`)
       return `列表:${this.resolveType(t.typeArgs[0])}`
@@ -185,8 +219,9 @@ export class CodeGen {
       if (t.typeArgs.length !== 2) throw new Unsupported('表 需要 2 个类型参数')
       const k = this.resolveType(t.typeArgs[0])
       const v = this.resolveType(t.typeArgs[1])
-      if (k !== '文本' && k !== '整数') throw new Unsupported('表的键只支持 文本 或 整数')
-      if (!['整数', '小数', '文本', '真假'].includes(v)) throw new Unsupported('表的值只支持基本类型')
+      if (k !== '文本' && k !== '真假' && !isIntegerType(k)) throw new Unsupported('表的键只支持 文本、整数或真假类型')
+      const nested = v.startsWith('列表:') || v.startsWith('表:') || v.endsWith('[]')
+      if (!nested && !['整数', '浮点数', '长小数', '文本', '字符', '真假'].includes(v)) throw new Unsupported('表的值只支持基本类型、列表、表或数组')
       return `表:${k}:${v}`
     }
     if (t.typeArgs.length > 0) throw new Unsupported('自定义泛型')
@@ -209,8 +244,11 @@ export class CodeGen {
 
   private cType(t: CType): string {
     switch (t) {
-      case '整数': return 'CsayInt'
-      case '小数': return 'CsayFloat'
+      case '字节': case '有符号字节': case '短整数': case '无符号短整数':
+      case '整数': case '无符号整数': case '长整数': case '无符号长整数': case '字符':
+        return 'CsayInt'
+      case '浮点数': return 'CsayFloat32'
+      case '长小数': return 'CsayFloat'
       case '文本': return 'CsayStr'
       case '真假': return 'CsayBool'
       case '无': return 'void'
@@ -224,7 +262,7 @@ export class CodeGen {
       return `CsayEntry_${k}_${v}`
     }
     if (t.startsWith('表:')) return 'CsayMap*'
-    if (t.endsWith('[]')) return this.cType(t.slice(0, -2))
+    if (t.endsWith('[]')) return this.cType(t.slice(0, -2)) + '*'
     if (t.startsWith('列表:')) return 'CsayList*'
     if (t.startsWith('委托:')) return this.delegates.get(t.slice(3))!.cn
     if (t.startsWith('枚举:')) return 'Csay_' + t.slice(3)
@@ -232,6 +270,32 @@ export class CodeGen {
     if (t.startsWith('类:')) return 'Csay_' + t.slice(2) + '*'
     if (t.startsWith('结构:')) return 'Csay_' + t.slice(3)
     throw new Unsupported(`类型 ${t}`)
+  }
+
+  /** JSON序列化 的递归类型描述。 */
+  private jsonDesc(t: CType): string | null {
+    if (t === '文本') return 's'
+    if (t === '字符') return 'c'
+    if (isIntegerType(t)) return 'i'
+    if (t === '浮点数') return 'f'
+    if (t === '长小数') return 'd'
+    if (t === '真假') return 'b'
+    if (t.startsWith('表:')) {
+      const { k, v } = this.mapParts(t)
+      const key = k === '文本' ? 's' : k === '真假' ? 'b' : isIntegerType(k) ? 'i' : null
+      if (key === null) return null
+      const val = this.jsonDesc(v)
+      return val === null ? null : 'm' + key + val
+    }
+    if (t.endsWith('[]')) {
+      const elem = this.jsonDesc(t.slice(0, -2))
+      return elem === null ? null : 'A' + elem
+    }
+    if (t.startsWith('列表:')) {
+      const elem = this.jsonDesc(t.slice(3))
+      return elem === null ? null : 'l' + elem
+    }
+    return null
   }
 
   /** 接口引用的 C 类型名，用于构造复合字面量 */
@@ -243,25 +307,57 @@ export class CodeGen {
    * 类型适配：把值变成目标类型。
    * 目前只有一种转换——类对象 → 接口引用（带上虚表指针）。
    */
+  private delegateThunk(d: DelegateInfo, fn: string): string {
+    if (d.params.some((p) => p.endsWith('[]'))) throw new Unsupported('委托的数组参数暂不能直接绑定普通函数')
+    const cn = `Csay_delegate_${this.counter++}`
+    const params = ['void* env', ...d.params.map((p, i) => `${this.cType(p)} a${i}`)]
+    this.lambdaProtos.push(`static ${this.cType(d.ret)} ${cn}(${params.join(', ')});`)
+    this.lambdaBodies.push(`static ${this.cType(d.ret)} ${cn}(${params.join(', ')}) {`)
+    this.lambdaBodies.push('    (void)env;')
+    const call = `${fn}(${d.params.map((_, i) => `a${i}`).join(', ')})`
+    this.lambdaBodies.push(d.ret === '无' ? `    ${call};` : `    return ${call};`)
+    this.lambdaBodies.push('}')
+    this.lambdaBodies.push('')
+    return cn
+  }
+
   private coerce(v: Value, target: CType): string {
     if (target.startsWith('委托:')) {
       const d = this.delegates.get(target.slice(3))
       if (d === undefined) throw new Unsupported(`委托 ${target}`)
       if (v.t === target) return v.c
+      if (v.c === 'NULL') return `(${this.cType(target)}){ 0 }`
       if (v.t.startsWith('函数:')) {
         const sig = `函数:${d.params.join(',')}->${d.ret}`
-        if (v.t !== sig) throw new Unsupported(`Lambda 签名与委托「${d.name}」不一致`)
+        if (v.t !== sig) throw new Unsupported(`函数签名与委托「${d.name}」不一致`)
+        if (v.direct === true) {
+          const thunk = this.delegateThunk(d, v.c)
+          return `(${this.cType(target)}){ 0, ${thunk} }`
+        }
         return `(${this.cType(target)}){ ${v.env ?? '0'}, ${v.c} }`
       }
       throw new Unsupported(`把「${v.t}」赋给委托「${d.name}」`)
     }
     if (v.t.startsWith('函数:')) throw new Unsupported('Lambda 只能赋给委托变量或参数')
     if (isErrorType(target)) {
+      if (v.c === 'NULL') return 'csay_error_null()'
       if (v.t === '文本') return `csay_error(${v.c}, ${errorKindOf(target)})`
       return v.c
     }
+    if (target === '文本' && v.t !== '文本') return this.toStr(v)
+    if (isIntegerType(target)) {
+      const base = v.t === '文本' ? `csay_str_to_int(${v.c})`
+        : (v.t === '浮点数' || v.t === '长小数') ? `((CsayInt)(${v.c}))`
+        : v.c
+      return `((CsayInt)((${INT_CASTS[target]})(${base})))`
+    }
+    if (target === '浮点数' && v.t === '文本') return `csay_str_to_float32(${v.c})`
+    if (target === '长小数' && v.t === '文本') return `csay_str_to_float(${v.c})`
+    if (target === '浮点数' && v.t !== '浮点数') return `((CsayFloat32)(${v.c}))`
+    if (target === '长小数' && v.t !== '长小数') return `((CsayFloat)(${v.c}))`
     if (!target.startsWith('接口:')) return v.c
     const iface = target.slice(3)
+    if (v.c === 'NULL') return `(${this.refType(target)}){ 0 }`
     if (v.t === target) return v.c
     if (v.t.startsWith('类:')) {
       const cls = this.objName(v.t)
@@ -274,17 +370,32 @@ export class CodeGen {
   }
 
   private defaultOf(t: CType): string {
-    if (t === '整数') return '0'
-    if (t === '小数') return '0.0'
+    if (isIntegerType(t)) return '0'
+    if (t === '浮点数') return '0.0f'
+    if (t === '长小数') return '0.0'
     if (t === '文本') return 'csay_str("", 0)'
     if (t === '真假') return 'false'
     if (t === '无') return ''
-    if (isErrorType(t)) return 'csay_error(csay_str("", 0), 0)'
+    if (isErrorType(t)) return 'csay_error_null()'
     if (t.startsWith('委托:')) return `(${this.cType(t)}){ 0 }`
+    if (t.startsWith('接口:')) return `(${this.cType(t)}){ 0 }`
     return 'NULL'
   }
 
-  private isArray(t: CType): boolean { return t.endsWith('[]') }
+  private isArray(t: CType): boolean {
+    return t.endsWith('[]') && !t.startsWith('表:')
+  }
+  private isSelfField(name: string): boolean {
+    if (this.selfType === null || this.lookup(name) !== undefined) return false
+    return this.findField(this.objName(this.selfType), name) !== null
+  }
+  private isArrayField(e: Expr): boolean {
+    return e.kind === 'member' || (e.kind === 'name' && this.isSelfField(e.name))
+  }
+  private arrayLenOf(e: Expr, v: Value): string {
+    if (e.kind === 'name' && !this.isSelfField(e.name)) return `${v.c}_len`
+    return `csay_array_len(${v.c})`
+  }
   private isObj(t: CType): boolean { return t.startsWith('类:') || t.startsWith('结构:') }
   private isClass(t: CType): boolean { return t.startsWith('类:') }
   private objName(t: CType): string { return t.slice(t.indexOf(':') + 1) }
@@ -327,6 +438,10 @@ export class CodeGen {
     if (cur !== null && cur === owner) return
     throw new Unsupported(`不能访问私有${kind}「${name}」`)
   }
+  private checkCtorAccess(ctor: CtorInfo, owner: string): void {
+    this.checkAccess(ctor.vis, owner, '构造器', owner)
+  }
+
   private typeInfo(t: CType): TypeInfo {
     const info = this.types.get(this.objName(t))
     if (info === undefined) throw new Unsupported(`类型 ${t}`)
@@ -360,14 +475,14 @@ export class CodeGen {
     return null
   }
 
-  private findField(owner: string, name: string): { path: string[]; type: CType; name: string; vis: Visibility; isReadonly: boolean; owner: string } | null {
+  private findField(owner: string, name: string): { path: string[]; type: CType; name: string; vis: Visibility; isReadonly: boolean; isConst: boolean; constC: string | null; owner: string } | null {
     let cur: string | null = owner
     const path: string[] = []
     while (cur !== null) {
       const info = this.types.get(cur)
       if (info === undefined) return null
       const f = info.fields.find((x) => x.name === name && !x.isStatic)
-      if (f !== undefined) return { path: [...path, f.cn], type: f.type, name: f.name, vis: f.vis, isReadonly: f.isReadonly, owner: cur }
+      if (f !== undefined) return { path: [...path, f.cn], type: f.type, name: f.name, vis: f.vis, isReadonly: f.isReadonly, isConst: f.isConst, constC: f.constC, owner: cur }
       if (info.base === null) return null
       const baseInfo = this.types.get(info.base)
       if (baseInfo === undefined || baseInfo.kind === 'interface') return null
@@ -392,33 +507,66 @@ export class CodeGen {
     return null
   }
 
+  private findStaticProp(owner: string, name: string): (PropInfo & { owner: string }) | null {
+    let cur: string | null = owner
+    while (cur !== null) {
+      const info = this.types.get(cur)
+      if (info === undefined) return null
+      const p = info.props.find((x) => x.name === name && x.isStatic)
+      if (p !== undefined) return { ...p, owner: cur }
+      if (info.base === null) return null
+      const baseInfo = this.types.get(info.base)
+      if (baseInfo === undefined || baseInfo.kind === 'interface') return null
+      cur = info.base
+    }
+    return null
+  }
+
   private staticFieldCName(owner: string, field: FieldInfo): string {
     return `${this.types.get(owner)!.cn}_${field.cn}`
   }
 
-  private findMethodWithOwner(owner: string, name: string): { owner: string; method: MethodInfo } | null {
+  /** 静态字段声明处的初始化表达式，按类型和字段顺序生成一个初始化函数。 */
+  private staticInitBodies(): string[] {
+    const out: string[] = []
+    for (const info of this.types.values()) {
+      if (info.kind === 'interface' || info.kind === 'enum') continue
+      const inits = info.fields.filter((f) => f.isStatic && f.init !== null)
+      if (inits.length === 0) continue
+      const savedOut = this.out
+      const savedSelf = this.selfType
+      this.out = []
+      this.selfType = info.kind === 'class' ? `类:${info.name}` : `结构:${info.name}`
+      this.enter()
+      for (const f of inits) {
+        const v = this.expr(f.init!)
+        this.out.push(`    ${this.staticFieldCName(info.name, f)} = ${this.coerce(v, f.type)};`)
+      }
+      this.leave()
+      out.push(`static void ${info.cn}_static_init(void) {`, ...this.out, '}')
+      this.out = savedOut
+      this.selfType = savedSelf
+    }
+    return out
+  }
+
+  private findMethodsWithOwner(owner: string, name: string): { owner: string; method: MethodInfo }[] {
     let cur: string | null = owner
     while (cur !== null) {
       const info = this.types.get(cur)
-      if (info === undefined) return null
-      const m = info.methods.find((x) => x.name === name)
-      if (m !== undefined) return { owner: cur, method: m }
-      if (info.base === null) return null
+      if (info === undefined) return []
+      const list = info.methods.filter((x) => x.name === name).map((method) => ({ owner: cur as string, method }))
+      if (list.length > 0) return list
+      if (info.base === null) return []
       cur = info.base
     }
-    return null
+    return []
+  }
+  private findMethodWithOwner(owner: string, name: string): { owner: string; method: MethodInfo } | null {
+    return this.findMethodsWithOwner(owner, name)[0] ?? null
   }
   private findMethod(owner: string, name: string): MethodInfo | null {
-    let cur: string | null = owner
-    while (cur !== null) {
-      const info = this.types.get(cur)
-      if (info === undefined) return null
-      const m = info.methods.find((x) => x.name === name)
-      if (m !== undefined) return m
-      if (info.base === null) return null
-      cur = info.base
-    }
-    return null
+    return this.findMethodsWithOwner(owner, name)[0]?.method ?? null
   }
 
   private findProp(owner: string, name: string): PropInfo | null {
@@ -440,7 +588,7 @@ export class CodeGen {
     const decls = flattenDecls(unit.decls)
     for (const d of decls) {
       if (d.kind !== 'delegate') continue
-      const info: DelegateInfo = { name: d.name, cn: `Csay_${d.name}`, params: [], ret: '无', raw: d }
+      const info: DelegateInfo = { name: d.name, cn: `Csay_${d.name}`, params: [], ret: '无', raw: d, paramNames: d.params.map((p) => p.name) }
       this.delegates.set(d.name, info)
       this.delegateOrder.push(info)
     }
@@ -463,6 +611,25 @@ export class CodeGen {
         this.types.set(d.name, { ...common, kind: d.kind })
       }
     }
+
+    const addAliases = (list: Decl[], path: string[]): void => {
+      for (const d of list) {
+        if (d.kind === 'namespace') {
+          addAliases(d.decls, [...path, ...d.name.split('.')])
+          continue
+        }
+        const qualified = [...path, d.name].join('.')
+        if (d.kind === 'delegate') {
+          this.typeAliases.set(qualified, `委托:${d.name}`)
+          continue
+        }
+        const info = this.types.get(d.name)
+        if (info === undefined) continue
+        const kind = info.kind === 'enum' ? '枚举' : info.kind === 'interface' ? '接口' : info.kind === 'class' ? '类' : '结构'
+        this.typeAliases.set(qualified, `${kind}:${info.name}`)
+      }
+    }
+    addAliases(unit.decls, [])
 
     for (const info of this.delegateOrder) {
       const d = info.raw as Extract<Decl, { kind: 'delegate' }>
@@ -494,15 +661,21 @@ export class CodeGen {
         if (m.kind === 'field') {
           const vis = this.visOf(m.modifiers)
           const isStatic = m.modifiers.includes('静态')
-          if (isStatic && m.init !== null) throw new Unsupported(`静态字段「${m.name}」暂不支持初始化`)
-          info.fields.push({ name: m.name, cn: `m${fi++}`, type: this.resolveType(m.type), vis, isPrivate: vis === '私有', isReadonly: m.modifiers.includes('只读') || m.modifiers.includes('常'), isStatic, init: m.init })
+          const type = this.resolveType(m.type)
+          const isConst = m.modifiers.includes('常')
+          const constC = isConst && m.init !== null ? this.coerce(this.expr(m.init), type) : null
+          info.fields.push({ name: m.name, cn: `m${fi++}`, type, vis, isPrivate: vis === '私有', isReadonly: m.modifiers.includes('只读') || isConst, isConst, isStatic, init: m.init, constC })
         } else if (m.kind === 'method') {
           const vis = this.visOf(m.modifiers)
+          const overloadNo = info.methods.filter((x) => x.name === m.name).length
           info.methods.push({
             name: m.name,
-            cn: `${info.cn}_${m.name}`,
+            cn: overloadNo === 0 ? `${info.cn}_${m.name}` : `${info.cn}_${m.name}__${overloadNo + 1}`,
             ret: this.resolveType(m.ret),
             params: m.params.map((p) => this.resolveType(p.type)),
+            defaults: m.params.map((p) => p.def),
+            modes: m.params.map((p) => p.mode ?? null),
+            minArgs: minArgsOf(m.params),
             isStatic: m.modifiers.includes('静态'),
             vis,
             isPrivate: vis === '私有',
@@ -513,6 +686,10 @@ export class CodeGen {
             cn: `${info.cn}_new`,
             initCn: `${info.cn}_init`,
             params: m.params.map((p) => this.resolveType(p.type)),
+            defaults: m.params.map((p) => p.def),
+            modes: m.params.map((p) => p.mode ?? null),
+            minArgs: minArgsOf(m.params),
+            vis: this.visOf(m.modifiers),
             raw: m,
           })
         } else if (m.kind === 'prop') {
@@ -526,6 +703,7 @@ export class CodeGen {
             setCn: setA === undefined ? null : `${info.cn}_set_${m.name}`,
             vis,
             isPrivate: vis === '私有',
+            isStatic: m.modifiers.includes('静态'),
             raw: m,
           })
         }
@@ -586,6 +764,10 @@ export class CodeGen {
             cn: `${info.cn}_${m.name}`,
             ret: this.resolveType(m.ret),
             params: m.params.map((p) => this.resolveType(p.type)),
+            modes: m.params.map((p) => p.mode ?? null),
+            defaults: m.params.map((p) => p.def),
+            minArgs: minArgsOf(m.params),
+            paramNames: m.params.map((p) => p.name),
           })
         } else if (m.kind === 'ifaceProp') {
           info.ifaceProps.push({
@@ -623,7 +805,11 @@ export class CodeGen {
       const info = this.types.get(cur)
       if (info === undefined) return null
       const md = info.methods.find((x) => x.name === m.name && x.params.length === m.params.length)
-      if (md !== undefined) return { owner: cur, method: md }
+      if (md !== undefined) {
+        const sameModes = md.modes.every((x, i) => x === m.modes[i])
+        if (!sameModes || md.params.some((x, i) => x !== m.params[i])) return null
+        return { owner: cur, method: md }
+      }
       cur = info.base
     }
     return null
@@ -634,7 +820,8 @@ export class CodeGen {
   expr(e: Expr): Value {
     switch (e.kind) {
       case 'int': return { c: `${e.text}LL`, t: '整数' }
-      case 'float': return { c: e.text, t: '小数' }
+      case 'float': return { c: e.text, t: '长小数' }
+      case 'char': return { c: `${e.value}LL`, t: '字符' }
       case 'string': return { c: this.interp(e.segs), t: '文本' }
       case 'bool': return { c: e.value ? 'true' : 'false', t: '真假' }
       case 'null': return { c: 'NULL', t: '未知' }
@@ -647,11 +834,13 @@ export class CodeGen {
           const sf = this.findStaticField(owner, e.name)
           if (sf !== null) {
             this.checkAccess(sf.vis, sf.owner, '字段', sf.name)
+            if (sf.isConst && sf.constC !== null) return { c: sf.constC, t: sf.type }
             return { c: this.staticFieldCName(sf.owner, sf), t: sf.type }
           }
           const field = this.findField(owner, e.name)
           if (field !== null) {
             this.checkAccess(field.vis, field.owner, '字段', field.name)
+            if (field.isConst && field.constC !== null) return { c: field.constC, t: field.type }
             const path = 'self->' + field.path.join('.')
             return { c: path, t: field.type }
           }
@@ -659,8 +848,15 @@ export class CodeGen {
           if (prop !== null && prop.getCn !== null) {
             const found = this.findPropWithOwner(owner, e.name)!
             this.checkAccess(prop.vis, found.owner, '属性', prop.name)
-            return { c: `${prop.getCn}(self)`, t: prop.type }
+            return { c: `${prop.getCn}(${prop.isStatic ? '' : 'self'})`, t: prop.type }
           }
+        }
+        const fns = this.funcs.get(e.name)
+        if (fns !== undefined) {
+          if (fns.length !== 1) throw new Unsupported(`重载函数「${e.name}」不能直接作为值`)
+          const f = fns[0]
+          if (f.modes.some((m) => m !== null)) throw new Unsupported('带引用/输出参数的函数不能直接作为委托值')
+          return { c: f.cn, t: `函数:${f.params.join(',')}->${f.ret}`, direct: true }
         }
         throw new Unsupported(`变量「${e.name}」尚未声明`)
       }
@@ -681,6 +877,10 @@ export class CodeGen {
       case 'value': {
         if (this.lookup('__value__') === undefined) throw new Unsupported('值 只能在属性的 写 里用')
         return { c: '_value', t: this.lookup('__value__')! }
+      }
+      case 'cast': {
+        const target = this.resolveType(e.type)
+        return { c: this.coerce(this.expr(e.expr), target), t: target }
       }
       case 'paren': return this.expr(e.expr)
       case 'unary': {
@@ -722,9 +922,15 @@ export class CodeGen {
       case 'new': return this.newObject(e)
       case 'array': {
         if (e.elems.length === 0) throw new Unsupported('空数组字面量')
-        const elem = this.expr(e.elems[0]).t
-        const items = e.elems.map((x) => this.coerce(this.expr(x), elem))
-        return { c: `(${this.cType(elem)}[]){${items.join(', ')}}`, t: `${elem}[]` }
+        const first = this.expr(e.elems[0])
+        const elem = first.t
+        const items = [this.coerce(first, elem), ...e.elems.slice(1).map((x) => this.coerce(this.expr(x), elem))]
+        const elemC = this.cType(elem)
+        const tmp = this.fresh('_arr')
+        return {
+          c: `({ ${elemC}* ${tmp} = (${elemC}*)csay_array_alloc(${items.length}, (int64_t)sizeof(${elemC})); ${items.map((x, i) => `${tmp}[${i}] = ${x};`).join(' ')} ${tmp}; })`,
+          t: `${elem}[]`,
+        }
       }
       case 'lambda': return this.compileLambda(e)
     }
@@ -739,7 +945,7 @@ export class CodeGen {
 
     const names = new Set<string>()
     collectNameRefs(e.body, names)
-    const captures: Array<{ name: string; type: CType; c: string }> = []
+    const captures: Array<{ name: string; type: CType; c: string; len?: string }> = []
     for (const name of names) {
       if (name === '自') {
         if (this.selfType !== null) captures.push({ name, type: this.selfType, c: 'self' })
@@ -748,8 +954,12 @@ export class CodeGen {
       if (this.scopes[0]?.has(name)) continue
       const t = this.lookup(name)
       if (t === undefined) continue
-      if (t.endsWith('[]')) throw new Unsupported('Lambda 暂不支持捕获数组')
-      captures.push({ name, type: t, c: this.cname(name) })
+      captures.push({
+        name,
+        type: t,
+        c: this.cname(name),
+        len: t.endsWith('[]') ? this.cname(name) + '_len' : undefined,
+      })
     }
     const hasSelf = captures.some((c) => c.name === '自')
 
@@ -761,9 +971,10 @@ export class CodeGen {
     const savedCtor = this.inCtor
     const savedRegion = this.regionStack
     const savedUsing = this.usingDepth
+    const savedUsingStack = this.usingStack
     const savedLoop = this.loopDepth
     const savedMethods = this.classMethods
-    const savedVoidBlock = this.lambdaVoidBlock
+    const savedBlockRet = this.lambdaBlockRet
 
     this.out = []
     this.indent = 1
@@ -773,6 +984,7 @@ export class CodeGen {
     this.inCtor = false
     this.regionStack = []
     this.usingDepth = 0
+    this.usingStack = []
     this.loopDepth = 0
     this.classMethods = hasSelf ? savedMethods : null
     this.enter()
@@ -783,9 +995,10 @@ export class CodeGen {
     }
     let ret: CType = '无'
     if (e.body.kind === 'block') {
-      this.lambdaVoidBlock = true
+      this.lambdaBlockRet = (e.retType as CType | undefined) ?? null
+      this.currentRet = this.lambdaBlockRet
       for (const st of e.body.stmts) this.stmt(st)
-      this.lambdaVoidBlock = false
+      ret = this.lambdaBlockRet ?? '无'
     } else {
       const v = this.expr(e.body)
       ret = v.t
@@ -802,31 +1015,38 @@ export class CodeGen {
     this.inCtor = savedCtor
     this.regionStack = savedRegion
     this.usingDepth = savedUsing
+    this.usingStack = savedUsingStack
     this.loopDepth = savedLoop
     this.classMethods = savedMethods
-    this.lambdaVoidBlock = savedVoidBlock
+    this.lambdaBlockRet = savedBlockRet
 
     const decls = e.params.map((p, i) => `${this.cType(params[i])} ${this.cname(p.name)}`)
     const ps = ['void* env', ...decls].join(', ')
     const bindings: string[] = []
     let env: string | undefined
     if (captures.length > 0) {
-      const fields = captures.map((c, i) => `${this.cType(c.type)} c${i};`)
+      const fields = captures.map((c, i) => `${this.cType(c.type)} c${i};${c.len !== undefined ? ` CsayInt c${i}_len;` : ''}`)
       this.lambdaProtos.push(`typedef struct ${envCn} { ${fields.join(' ')} } ${envCn};`)
-      const envParams = captures.map((c, i) => `${this.cType(c.type)} a${i}`).join(', ')
+      const envParams = captures.map((c, i) => `${this.cType(c.type)} a${i}${c.len !== undefined ? `, CsayInt a${i}_len` : ''}`).join(', ')
       this.lambdaProtos.push(`static void* ${envCn}_alloc(${envParams});`)
       this.lambdaBodies.push(`static void* ${envCn}_alloc(${envParams}) {`)
       this.lambdaBodies.push(`    ${envCn}* e = (${envCn}*)csay_alloc((int64_t)sizeof(${envCn}));`)
-      captures.forEach((c, i) => this.lambdaBodies.push(`    e->c${i} = a${i};`))
+      captures.forEach((c, i) => {
+        this.lambdaBodies.push(`    e->c${i} = a${i};`)
+        if (c.len !== undefined) this.lambdaBodies.push(`    e->c${i}_len = a${i}_len;`)
+      })
       this.lambdaBodies.push('    return (void*)e;')
       this.lambdaBodies.push('}')
       this.lambdaBodies.push('')
       bindings.push(`    ${envCn}* e = (${envCn}*)env;`)
       captures.forEach((c, i) => {
         if (c.name === '自') bindings.push(`    ${this.cType(c.type)} self = e->c${i};`)
-        else bindings.push(`    ${this.cType(c.type)} ${c.c} = e->c${i};`)
+        else {
+          bindings.push(`    ${this.cType(c.type)} ${c.c} = e->c${i};`)
+          if (c.len !== undefined) bindings.push(`    CsayInt ${c.c}_len = e->c${i}_len;`)
+        }
       })
-      env = `${envCn}_alloc(${captures.map((c) => c.c).join(', ')})`
+      env = `${envCn}_alloc(${captures.map((c) => c.len !== undefined ? `${c.c}, ${c.len}` : c.c).join(', ')})`
     } else {
       bindings.push('    (void)env;')
     }
@@ -852,10 +1072,14 @@ export class CodeGen {
     if (isErrorType(v.t)) return `${v.c}.msg`
     switch (v.t) {
       case '文本': return v.c
-      case '整数': return `csay_str_of_int(${v.c})`
-      case '小数': return `csay_str_of_float(${v.c})`
+      case '字符': return `csay_char_of_code(${v.c})`
+      case '浮点数': return `csay_str_of_float32(${v.c})`
+      case '长小数': return `csay_str_of_float(${v.c})`
       case '真假': return `csay_str_of_bool(${v.c})`
-      default: throw new Unsupported('把这种值转成文本')
+      default:
+        if (isIntegerType(v.t)) return `csay_str_of_int(${v.c})`
+        if (v.t.startsWith('枚举:')) return `csay_str_of_int((CsayInt)(${v.c}))`
+        throw new Unsupported('把这种值转成文本')
     }
   }
 
@@ -867,7 +1091,66 @@ export class CodeGen {
   private binary(op: string, le: Expr, re: Expr): Value {
     const l = this.expr(le)
     const r = this.expr(re)
+    if (op === '??') {
+      if (isErrorType(l.t)) {
+        return { c: `csay_error_coalesce(${l.c}, ${this.coerce(r, l.t)})`, t: l.t }
+      }
+      if (l.t.startsWith('接口:')) {
+        const tmp = this.fresh('coalesce')
+        return {
+          c: `({ ${this.cType(l.t)} ${tmp} = ${l.c}; ${tmp}.obj != NULL ? ${tmp} : ${this.coerce(r, l.t)}; })`,
+          t: l.t,
+        }
+      }
+      if (l.t.startsWith('委托:')) {
+        const tmp = this.fresh('coalesce')
+        return {
+          c: `({ ${this.cType(l.t)} ${tmp} = ${l.c}; ${tmp}.fn != NULL ? ${tmp} : ${this.coerce(r, l.t)}; })`,
+          t: l.t,
+        }
+      }
+      if (!this.isClass(l.t) && !l.t.startsWith('列表:') && !l.t.startsWith('表:')) {
+        throw new Unsupported(`?? 不支持类型 ${l.t}`)
+      }
+      const tmp = this.fresh('coalesce')
+      return {
+        c: `({ ${this.cType(l.t)} ${tmp} = ${l.c}; ${tmp} != NULL ? ${tmp} : ${this.coerce(r, l.t)}; })`,
+        t: l.t,
+      }
+    }
     if (op === '==' || op === '!=') {
+      const err = isErrorType(l.t) ? l : isErrorType(r.t) ? r : null
+      if (err !== null) {
+        const target = err.t
+        const eq = `csay_error_equal(${this.coerce(l, target)}, ${this.coerce(r, target)})`
+        return { c: op === '==' ? eq : `(!${eq})`, t: '真假' }
+      }
+      if (l.t.startsWith('接口:') && r.t.startsWith('接口:')) {
+        const a = this.fresh('itf')
+        const b = this.fresh('itf')
+        return {
+          c: `({ ${this.cType(l.t)} ${a} = ${l.c}; ${this.cType(r.t)} ${b} = ${r.c}; (${a}.obj == ${b}.obj); })`,
+          t: '真假',
+        }
+      }
+      const itf = l.t.startsWith('接口:') ? l : r.t.startsWith('接口:') ? r : null
+      if (itf !== null) {
+        const eq = this.withTemp(itf.t, itf.c, (v) => `(${v}.obj == NULL)`)
+        return { c: op === '==' ? eq : `(!${eq})`, t: '真假' }
+      }
+      if (l.t.startsWith('委托:') && r.t.startsWith('委托:')) {
+        const a = this.fresh('dg')
+        const b = this.fresh('dg')
+        return {
+          c: `({ ${this.cType(l.t)} ${a} = ${l.c}; ${this.cType(r.t)} ${b} = ${r.c}; (${a}.fn == ${b}.fn && ${a}.env == ${b}.env); })`,
+          t: '真假',
+        }
+      }
+      const dg = l.t.startsWith('委托:') ? l : r.t.startsWith('委托:') ? r : null
+      if (dg !== null) {
+        const eq = this.withTemp(dg.t, dg.c, (v) => `(${v}.fn == NULL)`)
+        return { c: op === '==' ? eq : `(!${eq})`, t: '真假' }
+      }
       if (l.t === '文本' || r.t === '文本') {
         const eq = `csay_str_eq(${l.c}, ${r.c})`
         return { c: op === '==' ? eq : `(!${eq})`, t: '真假' }
@@ -884,25 +1167,44 @@ export class CodeGen {
       if (l.t === '文本' || r.t === '文本') throw new Unsupported('文本与数字相加')
     }
     if (op === '+' || op === '-' || op === '*' || op === '/' || op === '%') {
-      const t: CType = l.t === '小数' || r.t === '小数' ? '小数' : '整数'
-      if (op === '%' && t === '小数') throw new Unsupported('小数取余')
+      const t: CType = l.t === '长小数' || r.t === '长小数'
+        ? '长小数'
+        : l.t === '浮点数' || r.t === '浮点数'
+          ? '浮点数'
+          : '整数'
+      if (op === '%' && (t === '浮点数' || t === '长小数')) throw new Unsupported('浮点取余')
       return { c: `(${l.c} ${op} ${r.c})`, t }
     }
     throw new Unsupported(`运算符 ${op}`)
   }
 
   /** 数组参数在 C 里要拆成「指针 + 长度」两个形参 */
-  private paramTypes(t: CType): string[] {
-    if (this.isArray(t)) return [`${this.cType(t)}*`, 'CsayInt']
+  private paramTypes(t: CType, mode?: 'ref' | 'out' | null): string[] {
+    if (mode === 'ref' || mode === 'out') return [this.cType(t) + '*']
+    if (this.isArray(t)) return [this.cType(t), 'CsayInt']
     return [this.cType(t)]
+  }
+
+  private ctorParamTypes(c: CtorInfo): string[] {
+    return c.params.map((p, i) => c.modes[i] === 'ref' || c.modes[i] === 'out' ? this.cType(p) + '*' : this.cType(p))
+  }
+
+  private methodParamTypes(m: { params: CType[]; modes: ('ref' | 'out' | null)[] }): string[] {
+    return m.params.map((p, i) => m.modes[i] === 'ref' || m.modes[i] === 'out' ? this.cType(p) + '*' : this.cType(p))
+  }
+
+  private ifaceParamTypes(m: IfaceMethod): string[] {
+    return this.methodParamTypes(m)
   }
 
   private paramDecls(params: Param[], types: CType[]): string[] {
     const out: string[] = []
     params.forEach((p, i) => {
-      const cn = this.cname(p.name)
-      if (this.isArray(types[i])) {
-        out.push(`${this.cType(types[i])}* ${cn} /* ${p.name} */`, `CsayInt ${cn}_len`)
+      const cn = p.mode === 'ref' || p.mode === 'out' ? p.name : this.cname(p.name)
+      if (p.mode === 'ref' || p.mode === 'out') {
+        out.push(`${this.cType(types[i])}* ${cn} /* ${p.name} */`)
+      } else if (this.isArray(types[i])) {
+        out.push(`${this.cType(types[i])} ${cn} /* ${p.name} */`, `CsayInt ${cn}_len`)
       } else {
         out.push(`${this.cType(types[i])} ${cn} /* ${p.name} */`)
       }
@@ -911,18 +1213,47 @@ export class CodeGen {
   }
 
   /** 实参展开：数组要额外传长度 */
-  private callArgs(args: Expr[], targets: CType[]): string[] {
+  private callArgs(args: Expr[], targets: CType[], modes: ('ref' | 'out' | null)[] = [], arraysAsPointer = false): string[] {
     const out: string[] = []
     args.forEach((a, i) => {
+      if (modes[i] === 'ref' || modes[i] === 'out') {
+        if (a.kind !== 'byref' || a.expr.kind !== 'name') throw new Unsupported('引用/输出实参必须是变量')
+        out.push('&' + this.cname(a.expr.name))
+        return
+      }
+      if (a.kind === 'byref') throw new Unsupported('参数不是引用/输出参数')
       const v = this.expr(a)
       if (this.isArray(targets[i])) {
         if (!this.isArray(v.t)) throw new Unsupported('数组参数只能传数组变量，不能传字面量')
-        out.push(v.c, `${v.c}_len`)
+        if (arraysAsPointer) out.push(v.c)
+        else out.push(v.c, this.arrayLenOf(a, v))
       } else {
         out.push(this.coerce(v, targets[i]))
       }
     })
     return out
+  }
+
+  /** 省略的实参用声明处的默认表达式补齐；默认值只允许常量表达式 */
+  private callArgsWithDefaults(args: Expr[], targets: CType[], defaults: (Expr | null)[], modes: ('ref' | 'out' | null)[] = [], arraysAsPointer = false): string[] {
+    const full = args.slice()
+    for (let i = full.length; i < targets.length; i++) {
+      const d = defaults[i]
+      if (d === null || d === undefined) throw new Unsupported('缺少参数')
+      full.push(d)
+    }
+    return this.callArgs(full, targets, modes, arraysAsPointer)
+  }
+
+  /** 命名参数按声明顺序重排；调用前已经由语义检查，这里再兜底报错。 */
+  private orderedArgs(args: Expr[], names: string[], defaults: (Expr | null)[], what: string): Expr[] {
+    const r = arrangeArguments(args, names, defaults)
+    if (r.error !== undefined) throw new Unsupported(`${what}${r.error}`)
+    return r.args
+  }
+
+  private orderedRaw(args: Expr[], params: Param[], defaults: (Expr | null)[], what: string): Expr[] {
+    return this.orderedArgs(args, params.map((p) => p.name), defaults, what)
   }
 
   private objPtr(v: Value): string {
@@ -931,9 +1262,11 @@ export class CodeGen {
 
   /** 表类型的键值类型：'表:文本:整数' → { k:'文本', v:'整数' } */
   private mapParts(t: CType): { k: CType; v: CType } {
-    const parts = t.split(':')
-    if (parts[0] !== '表' || parts.length !== 3) throw new Unsupported(`表类型 ${t}`)
-    return { k: parts[1], v: parts[2] }
+    if (!t.startsWith('表:')) throw new Unsupported(`表类型 ${t}`)
+    const rest = t.slice(2)
+    const i = rest.indexOf(':')
+    if (i < 0) throw new Unsupported(`表类型 ${t}`)
+    return { k: rest.slice(0, i), v: rest.slice(i + 1) }
   }
 
   /**
@@ -967,8 +1300,17 @@ export class CodeGen {
           const sf = this.findStaticField(info.name, e.target.name)
           if (sf !== null) {
             this.checkAccess(sf.vis, sf.owner, '字段', sf.name)
+            if (sf.isConst) throw new Unsupported(`常字段「${sf.name}」不能赋值`)
             const v = this.coerce(this.expr(e.value), sf.type)
             return { c: `(${this.staticFieldCName(sf.owner, sf)} ${e.op} ${v})`, t: sf.type }
+          }
+          const sp = this.findStaticProp(info.name, e.target.name)
+          if (sp !== null) {
+            this.checkAccess(sp.vis, sp.owner, '属性', sp.name)
+            if (sp.setCn === null) throw new Unsupported(`属性「${sp.name}」没有 写 访问器`)
+            if (e.op !== '=') throw new Unsupported(`静态属性上的 ${e.op}`)
+            const v = this.coerce(this.expr(e.value), sp.type)
+            return { c: `(${sp.setCn}(${v}), ${v})`, t: sp.type }
           }
         }
       }
@@ -994,9 +1336,10 @@ export class CodeGen {
         const field = this.findField(this.objName(tgt.t), e.target.name)
         if (field !== null) {
           this.checkAccess(field.vis, field.owner, '字段', field.name)
+          if (field.isConst) throw new Unsupported(`常字段「${field.name}」不能赋值`)
           if (field.isReadonly && !this.inCtor) throw new Unsupported(`只读字段「${field.name}」只能在构造器里赋值`)
           const path = field.path.join('.')
-          const acc = this.isClass(tgt.t) ? `${this.objPtr(tgt)}->${path}` : `${tgt.c}.${path}`
+          const acc = this.isClass(tgt.t) ? `${this.objPtr(tgt)}->${path}` : e.target.target.kind === 'this' ? `self->${path}` : `${tgt.c}.${path}`
           const v = this.coerce(this.expr(e.value), field.type)
           if (e.op !== '=' && field.type.startsWith('委托:')) throw new Unsupported('委托字段只能用 = 赋值')
           return { c: `(${acc} ${e.op} ${v})`, t: field.type }
@@ -1039,11 +1382,32 @@ export class CodeGen {
       const field = this.findField(owner, e.target.name)
       if (field !== null) {
         this.checkAccess(field.vis, field.owner, '字段', field.name)
+        if (field.isConst) throw new Unsupported(`常字段「${field.name}」不能赋值`)
         if (field.isReadonly && !this.inCtor) throw new Unsupported(`只读字段「${field.name}」只能在构造器里赋值`)
       }
     }
     const target = this.expr(e.target)
     const value = this.expr(e.value)
+    if (e.op === '=' && this.isArray(target.t)) {
+      const field = this.isArrayField(e.target)
+      if (e.value.kind === 'null') {
+        return field
+          ? { c: `(${target.c} = NULL, NULL)`, t: target.t }
+          : { c: `(${target.c} = NULL, ${target.c}_len = 0, NULL)`, t: target.t }
+      }
+      if (this.isArray(value.t)) {
+        if (field) return { c: `(${target.c} = ${value.c}, ${target.c})`, t: target.t }
+        if (e.value.kind === 'name') {
+          return { c: `(${target.c} = ${value.c}, ${target.c}_len = ${value.c}_len, ${value.c})`, t: target.t }
+        }
+        return { c: `(${target.c} = ${value.c}, ${target.c}_len = csay_array_len(${target.c}), ${target.c})`, t: target.t }
+      }
+      if (e.value.kind === 'array') {
+        if (field) return { c: `(${target.c} = ${value.c}, ${target.c})`, t: target.t }
+        return { c: `(${target.c} = ${value.c}, ${target.c}_len = ${e.value.elems.length}, ${target.c})`, t: target.t }
+      }
+      throw new Unsupported('数组变量只能赋另一个数组变量、数组字面量或 空')
+    }
     if (e.op === '=' && target.t.startsWith('接口:')) {
       return { c: `(${target.c} = ${this.coerce(value, target.t)})`, t: target.t }
     }
@@ -1074,7 +1438,138 @@ export class CodeGen {
     throw new Unsupported('对这个值取下标')
   }
 
+  private nullValue(t: CType): string {
+    if (t === '文本') return '(CsayStr){0}'
+    if (t === '异常' || t.startsWith('异常:')) return 'csay_error_null()'
+    if (t.startsWith('委托:') || t.startsWith('接口:')) return `(${this.cType(t)}){ 0 }`
+    return `(${this.cType(t)})0`
+  }
+
+  /** 为文本结果生成带空检查的小函数，避免 TCC 在实参里生成结构体三目表达式。 */
+  private nullSafeTextHelper(selfType: CType, bodyExpr: string, label: string, params: string[] = []): string {
+    const cn = this.fresh('Csay_ns_') + label
+    const ps = [ `${this.cType(selfType)} self`, ...params ]
+    this.lambdaProtos.push(`static CsayStr ${cn}(${ps.join(', ')});`)
+    this.lambdaBodies.push(`static CsayStr ${cn}(${ps.join(', ')}) {`)
+    this.lambdaBodies.push('    if (self == NULL) return (CsayStr){0};')
+    this.lambdaBodies.push(`    return ${bodyExpr};`)
+    this.lambdaBodies.push('}')
+    this.lambdaBodies.push('')
+    return cn
+  }
+
+  /** 接口引用是结构体，空检查看 obj；其余与文本辅助函数相同。 */
+  private nullSafeIfaceTextHelper(selfType: CType, bodyExpr: string, label: string, params: string[] = []): string {
+    const cn = this.fresh('Csay_ns_') + label
+    const ps = [ `${this.cType(selfType)} self`, ...params ]
+    this.lambdaProtos.push(`static CsayStr ${cn}(${ps.join(', ')});`)
+    this.lambdaBodies.push(`static CsayStr ${cn}(${ps.join(', ')}) {`)
+    this.lambdaBodies.push('    if (self.obj == NULL) return (CsayStr){0};')
+    this.lambdaBodies.push(`    return ${bodyExpr};`)
+    this.lambdaBodies.push('}')
+    this.lambdaBodies.push('')
+    return cn
+  }
+
+  private nullSafeMember(e: Extract<Expr, { kind: 'member' }>): Value {
+    const tgt = this.expr(e.target)
+    if (isErrorType(tgt.t)) {
+      if (e.name === '信息') return { c: `csay_error_ns_msg(${tgt.c})`, t: '文本' }
+      if (e.name === '类型') return { c: `csay_error_ns_kind(${tgt.c})`, t: '文本' }
+      throw new Unsupported(`异常没有成员「${e.name}」`)
+    }
+    if ((tgt.t.startsWith('列表:') || tgt.t.startsWith('表:')) && (e.name === '数量' || e.name === '长度')) {
+      const tmp = this.fresh('_ns')
+      this.push(`${this.cType(tgt.t)} ${tmp};`)
+      return { c: `((${tmp} = ${tgt.c}), ${tmp} != NULL ? ${tmp}->len : 0LL)`, t: '整数' }
+    }
+    if (this.isArray(tgt.t) && e.name === '长度') {
+      if (e.target.kind === 'name' && !this.isSelfField(e.target.name)) return { c: `(${tgt.c} != NULL ? ${tgt.c}_len : 0LL)`, t: '整数' }
+      return { c: `csay_array_len(${tgt.c})`, t: '整数' }
+    }
+    if (tgt.t.startsWith('接口:')) {
+      const iface = this.types.get(tgt.t.slice(3))
+      if (iface === undefined) throw new Unsupported(`接口 ${tgt.t}`)
+      let slot = iface.ifaceMethods.length
+      for (const p of iface.ifaceProps) {
+        if (p.name === e.name && p.hasGet) {
+          if (p.type === '文本') {
+            const cn = this.nullSafeIfaceTextHelper(tgt.t, `self.vt->m${slot}(self.obj)`, 'ip')
+            return { c: `${cn}(${tgt.c})`, t: p.type }
+          }
+          const tmp = this.fresh('_ns')
+          this.push(`${this.cType(tgt.t)} ${tmp};`)
+          return {
+            c: `((${tmp} = ${tgt.c}), ${tmp}.obj != NULL ? ${tmp}.vt->m${slot}(${tmp}.obj) : ${this.nullValue(p.type)})`,
+            t: p.type,
+          }
+        }
+        if (p.hasGet) slot++
+        if (p.hasSet) slot++
+      }
+      throw new Unsupported(`接口「${iface.name}」没有成员「${e.name}」`)
+    }
+    if (!this.isClass(tgt.t)) throw new Unsupported('?. 左边必须是类或接口对象')
+    const owner = this.objName(tgt.t)
+    const field = this.findField(owner, e.name)
+    if (field !== null) {
+      this.checkAccess(field.vis, field.owner, '字段', field.name)
+      if (field.isConst && field.constC !== null) return { c: field.constC, t: field.type }
+      const path = field.path.join('.')
+      if (field.type === '文本') {
+        const cn = this.nullSafeTextHelper(tgt.t, `self->${path}`, 'f')
+        return { c: `${cn}(${tgt.c})`, t: field.type }
+      }
+      const tmp = this.fresh('_ns')
+      this.push(`${this.cType(tgt.t)} ${tmp};`)
+      return {
+        c: `((${tmp} = ${tgt.c}), ${tmp} != NULL ? ${tmp}->${path} : ${this.nullValue(field.type)})`,
+        t: field.type,
+      }
+    }
+    const prop = this.findProp(owner, e.name)
+    if (prop !== null) {
+      if (prop.isStatic) throw new Unsupported(`静态属性「${e.name}」要通过类型名访问`)
+      const propOwner = this.findPropWithOwner(owner, e.name)!
+      this.checkAccess(prop.vis, propOwner.owner, '属性', prop.name)
+      if (prop.getCn === null) throw new Unsupported(`属性「${e.name}」没有 取 访问器`)
+      if (prop.type === '文本') {
+        const cn = this.nullSafeTextHelper(tgt.t, `${prop.getCn}(self)`, 'p')
+        return { c: `${cn}(${tgt.c})`, t: prop.type }
+      }
+      const tmp = this.fresh('_ns')
+      this.push(`${this.cType(tgt.t)} ${tmp};`)
+      return {
+        c: `((${tmp} = ${tgt.c}), ${tmp} != NULL ? ${prop.getCn}(${tmp}) : ${this.nullValue(prop.type)})`,
+        t: prop.type,
+      }
+    }
+    throw new Unsupported(`成员「${e.name}」`)
+  }
+
+  private memberPath(e: Extract<Expr, { kind: 'member' }>): string | null {
+    if (e.target.kind === 'name') return `${e.target.name}.${e.name}`
+    if (e.target.kind === 'member') {
+      const base = this.memberPath(e.target)
+      return base === null ? null : `${base}.${e.name}`
+    }
+    return null
+  }
+
   private member(e: Extract<Expr, { kind: 'member' }>): Value {
+    if (e.nullSafe === true) return this.nullSafeMember(e)
+    const path = this.memberPath(e)
+    if (path !== null) {
+      const dot = path.lastIndexOf('.')
+      const owner = path.slice(0, dot)
+      const alias = this.typeAliases.get(owner)
+      if (alias !== undefined && alias.startsWith('枚举:')) {
+        const info = this.types.get(alias.slice(3))
+        const item = info?.enumItems.find((x) => x.name === e.name)
+        if (item === undefined) throw new Unsupported(`枚举「${alias.slice(3)}」没有成员「${e.name}」`)
+        return { c: item.cn, t: alias }
+      }
+    }
     if (e.target.kind === 'name') {
       const info = this.types.get(e.target.name)
       if (info !== undefined && info.kind === 'enum') {
@@ -1086,7 +1581,14 @@ export class CodeGen {
         const sf = this.findStaticField(info.name, e.name)
         if (sf !== null) {
           this.checkAccess(sf.vis, sf.owner, '字段', sf.name)
+          if (sf.isConst && sf.constC !== null) return { c: sf.constC, t: sf.type }
           return { c: this.staticFieldCName(sf.owner, sf), t: sf.type }
+        }
+        const sp = this.findStaticProp(info.name, e.name)
+        if (sp !== null) {
+          this.checkAccess(sp.vis, sp.owner, '属性', sp.name)
+          if (sp.getCn === null) throw new Unsupported(`属性「${sp.name}」没有 取 访问器`)
+          return { c: `${sp.getCn}()`, t: sp.type }
         }
       }
     }
@@ -1116,12 +1618,14 @@ export class CodeGen {
       const field = this.findField(owner, name)
       if (field !== null) {
         this.checkAccess(field.vis, field.owner, '字段', field.name)
+        if (field.isConst && field.constC !== null) return { c: field.constC, t: field.type }
         const path = field.path.join('.')
         const code = this.isClass(tgt.t) ? `${this.objPtr(tgt)}->${path}` : e.target.kind === 'this' ? `self->${path}` : `${tgt.c}.${path}`
         return { c: code, t: field.type }
       }
       const prop = this.findProp(owner, name)
       if (prop !== null) {
+        if (prop.isStatic) throw new Unsupported(`静态属性「${name}」要通过类型名访问`)
         const propOwner = this.findPropWithOwner(owner, name)!; this.checkAccess(prop.vis, propOwner.owner, '属性', prop.name)
         if (prop.getCn === null) throw new Unsupported(`属性「${name}」没有 取 访问器`)
         return { c: `${prop.getCn}(${this.objPtr(tgt)})`, t: prop.type }
@@ -1140,9 +1644,12 @@ export class CodeGen {
       if (name === '类型') return { c: `csay_error_kind_name(${tgt.c}.kind)`, t: '文本' }
       throw new Unsupported(`异常的成员「${name}」`)
     }
-    if (tgt.t.startsWith('列表:') && name === '数量') return { c: `${tgt.c}->len`, t: '整数' }
+    if (tgt.t.startsWith('列表:') && (name === '数量' || name === '长度')) return { c: `${tgt.c}->len`, t: '整数' }
     if (tgt.t.startsWith('表:') && name === '数量') return { c: `${tgt.c}->len`, t: '整数' }
-    if (this.isArray(tgt.t) && name === '长度') return { c: `${tgt.c}_len`, t: '整数' }
+    if (this.isArray(tgt.t) && name === '长度') {
+      if (e.target.kind === 'name' && !this.isSelfField(e.target.name)) return { c: `${tgt.c}_len`, t: '整数' }
+      return { c: `csay_array_len(${tgt.c})`, t: '整数' }
+    }
     if (tgt.t === '文本' && name === '长度') return { c: `csay_utf8_len(${tgt.c})`, t: '整数' }
 
     throw new Unsupported(`成员访问「${name}」`)
@@ -1156,8 +1663,8 @@ export class CodeGen {
     }
     if (t.startsWith('表:')) {
       const { k, v } = this.mapParts(t)
-      const hashFn = k === '文本' ? 'csay_hash_str' : 'csay_hash_int'
-      const eqFn = k === '文本' ? 'csay_eq_str' : 'csay_eq_int'
+      const hashFn = k === '文本' ? 'csay_hash_str' : k === '真假' ? 'csay_hash_bool' : 'csay_hash_int'
+      const eqFn = k === '文本' ? 'csay_eq_str' : k === '真假' ? 'csay_eq_bool' : 'csay_eq_int'
       return {
         c: `csay_map_new((int64_t)sizeof(${this.cType(k)}), (int64_t)sizeof(${this.cType(v)}), ${hashFn}, ${eqFn})`,
         t,
@@ -1166,15 +1673,26 @@ export class CodeGen {
     if (!this.isObj(t)) throw new Unsupported(`新 ${t}`)
     const info = this.typeInfo(t)
     if (info.isAbstract) throw new Unsupported(`抽象类「${info.name}」不能实例化`)
-    const ctor = info.ctors.find((c) => c.params.length === e.args.length)
+    let ctor: CtorInfo | undefined
+    let ordered: Expr[] = []
+    for (const c of info.ctors) {
+      const r = arrangeArguments(e.args, c.raw.params.map((p: Param) => p.name), c.defaults)
+      if (r.error !== undefined) continue
+      if (r.args.length < c.minArgs || r.args.length > c.params.length) continue
+      ctor = c
+      ordered = r.args
+      break
+    }
     if (ctor === undefined) throw new Unsupported(`${info.name} 没有匹配的构造器`)
-    const args = this.callArgs(e.args, ctor.params)
+    this.checkCtorAccess(ctor, info.name)
+    const args = this.callArgsWithDefaults(ordered, ctor.params, ctor.defaults, ctor.modes, true)
     return { c: `${ctor.cn}(${args.join(', ')})`, t }
   }
 
   private delegateCall(t: CType, recv: string, args: Expr[]): Value {
     const d = this.delegates.get(t.slice(3))
     if (d === undefined) throw new Unsupported(`委托 ${t}`)
+    args = this.orderedArgs(args, d.paramNames, [], `委托「${d.name}」`)
     if (args.length !== d.params.length) throw new Unsupported(`委托「${d.name}」需要 ${d.params.length} 个参数`)
     const vals = args.map((a, i) => this.coerce(this.expr(a), d.params[i]))
     const tmp = this.fresh('dg')
@@ -1185,7 +1703,94 @@ export class CodeGen {
     }
   }
 
+  private nullSafeCall(e: Extract<Expr, { kind: 'call' }>): Value {
+    const member = e.callee as Extract<Expr, { kind: 'member' }>
+    const tgt = this.expr(member.target)
+    if (tgt.t.startsWith('接口:')) {
+      const iface = this.types.get(tgt.t.slice(3))
+      if (iface === undefined) throw new Unsupported(`接口 ${tgt.t}`)
+      const slot = iface.ifaceMethods.findIndex((x) => x.name === member.name)
+      if (slot < 0) throw new Unsupported(`方法「${member.name}」`)
+      const m = iface.ifaceMethods[slot]
+      const args = this.callArgsWithDefaults(this.orderedArgs(e.args, m.paramNames, m.defaults, `方法「${m.name}」`), m.params, m.defaults, m.modes)
+      if (m.ret === '文本') {
+        const ps = this.methodParamTypes(m).map((p, i) => `${p} p${i}`)
+        const ns = ['self.obj', ...m.params.map((_, i) => `p${i}`)].join(', ')
+        const cn = this.nullSafeIfaceTextHelper(tgt.t, `self.vt->m${slot}(${ns})`, 'im', ps)
+        return { c: `${cn}(${[tgt.c, ...args].join(', ')})`, t: m.ret }
+      }
+      const tmp = this.fresh('_ns')
+      this.push(`${this.cType(tgt.t)} ${tmp};`)
+      return {
+        c: `((${tmp} = ${tgt.c}), ${tmp}.obj != NULL ? ${tmp}.vt->m${slot}(${[tmp + '.obj', ...args].join(', ')}) : ${this.nullValue(m.ret)})`,
+        t: m.ret,
+      }
+    }
+    if (tgt.t.startsWith('列表:')) {
+      const elem = tgt.t.slice(3)
+      if (member.name !== '最大' && member.name !== '最小') throw new Unsupported(`?. 列表只支持 最大/最小`)
+      const suffix = elem === '整数' ? 'int' : elem === '浮点数' ? 'float32' : elem === '长小数' ? 'float' : null
+      if (suffix === null) throw new Unsupported(`?. 列表${member.name}（元素类型 ${elem}）`)
+      const fn = `csay_list_${member.name === '最大' ? 'max' : 'min'}_${suffix}`
+      const tmp = this.fresh('_ns')
+      this.push(`${this.cType(tgt.t)} ${tmp};`)
+      return { c: `((${tmp} = ${tgt.c}), ${tmp} != NULL ? ${fn}(${tmp}) : 0)`, t: elem }
+    }
+    if (tgt.t.startsWith('表:')) {
+      const { k, v } = this.mapParts(tgt.t)
+      if (member.name === '取值') {
+        const key = this.expr(e.args[0])
+        const def = this.expr(e.args[1])
+        const tmp = this.fresh('_ns')
+        this.push(`${this.cType(tgt.t)} ${tmp};`)
+        if (v === '文本') {
+          const call = this.kvBlock(k, key.c, '文本', def.c, (kk, vv) => `csay_map_text_or(${tmp}, &${kk}, ${vv})`)
+          return { c: `((${tmp} = ${tgt.c}), ${call})`, t: v }
+        }
+        if (v !== '整数' && v !== '浮点数' && v !== '长小数' && v !== '真假' && !v.startsWith('列表:') && !v.startsWith('表:') && !v.endsWith('[]')) {
+          throw new Unsupported(`?. 表取值不支持值类型 ${v}`)
+        }
+        const call = this.kvBlock(k, key.c, v, def.c, (kk, vv) => `*(${this.cType(v)}*)csay_map_ptr_or(${tmp}, &${kk}, &${vv})`)
+        return { c: `((${tmp} = ${tgt.c}), ${tmp} != NULL ? ${call} : ${def.c})`, t: v }
+      }
+      if (member.name !== '含') throw new Unsupported(`?. 表只支持 含/取值`)
+      const key = this.expr(e.args[0])
+      const tmp = this.fresh('_ns')
+      this.push(`${this.cType(tgt.t)} ${tmp};`)
+      const call = this.kvBlock(k, key.c, null, null, (kk) => `csay_map_has(${tmp}, &${kk})`)
+      return { c: `((${tmp} = ${tgt.c}), ${tmp} != NULL ? ${call} : false)`, t: '真假' }
+    }
+    if (!this.isClass(tgt.t)) throw new Unsupported('?. 左边必须是类、接口或列表对象')
+    const owner = this.objName(tgt.t)
+    const list = this.findMethodsWithOwner(owner, member.name)
+    const found = list.length > 1 ? list[member.overload ?? 0] : list[0]
+    if (found === undefined) throw new Unsupported(`方法「${member.name}」`)
+    const m = found.method
+    if (m.isStatic) throw new Unsupported(`?. 不能调用静态方法「${member.name}」`)
+    this.checkAccess(m.vis, found.owner, '方法', m.name)
+    const args = this.callArgsWithDefaults(this.orderedRaw(e.args, m.raw.params, m.defaults, `方法「${m.name}」`), m.params, m.defaults, m.modes)
+    const mods = m.raw.modifiers as string[]
+    const dispatch = mods.includes('虚拟') || mods.includes('覆盖') || mods.includes('抽象')
+    if (m.ret === '文本') {
+      const ps = this.methodParamTypes(m).map((p, i) => `${p} p${i}`)
+      const ns = ['self', ...m.params.map((_, i) => `p${i}`)].join(', ')
+      const call = dispatch ? `Csay_dispatch_${member.name}(${ns})` : `${m.cn}(${ns})`
+      const cn = this.nullSafeTextHelper(tgt.t, call, 'm', ps)
+      return { c: `${cn}(${[tgt.c, ...args].join(', ')})`, t: m.ret }
+    }
+    const tmp = this.fresh('_ns')
+    this.push(`${this.cType(tgt.t)} ${tmp};`)
+    const call = dispatch
+      ? `Csay_dispatch_${member.name}(${[tmp, ...args].join(', ')})`
+      : `${m.cn}(${[tmp, ...args].join(', ')})`
+    return {
+      c: `((${tmp} = ${tgt.c}), ${tmp} != NULL ? ${call} : ${this.nullValue(m.ret)})`,
+      t: m.ret,
+    }
+  }
+
   private call(e: Extract<Expr, { kind: 'call' }>): Value {
+    if (e.callee.kind === 'member' && e.callee.nullSafe === true) return this.nullSafeCall(e)
     if (e.callee.kind === 'name') {
       const t = this.lookup(e.callee.name)
       if (t !== undefined && t.startsWith('委托:')) {
@@ -1195,11 +1800,14 @@ export class CodeGen {
     if (e.callee.kind === 'member' && e.callee.target.kind === 'name') {
       const info = this.types.get(e.callee.target.name)
       if (info !== undefined && (info.kind === 'class' || info.kind === 'struct')) {
-        const m = this.findMethod(info.name, e.callee.name)
+        const list = this.findMethodsWithOwner(info.name, e.callee.name)
+        const found = list.length > 1 ? list[e.overload ?? 0] : list[0]
+        const m = found?.method ?? null
         if (m !== null) {
           if (!m.isStatic) throw new Unsupported(`方法「${e.callee.name}」不是静态方法`)
           this.checkAccess(m.vis, info.name, '方法', m.name)
-          return { c: `${m.cn}(${this.callArgs(e.args, m.params).join(', ')})`, t: m.ret }
+          const args = this.orderedRaw(e.args, m.raw.params, m.defaults, `方法「${m.name}」`)
+          return { c: `${m.cn}(${this.callArgsWithDefaults(args, m.params, m.defaults, m.modes).join(', ')})`, t: m.ret }
         }
       }
     }
@@ -1223,7 +1831,7 @@ export class CodeGen {
         const idx = iface.ifaceMethods.findIndex((m) => m.name === name)
         if (idx < 0) throw new Unsupported(`接口「${iface.name}」没有方法「${name}」`)
         const m = iface.ifaceMethods[idx]
-        const args = e.args.map((a, i) => this.coerce(this.expr(a), m.params[i]))
+        const args = this.callArgsWithDefaults(this.orderedArgs(e.args, m.paramNames, m.defaults, `接口方法「${name}」`), m.params, m.defaults, m.modes)
         return {
           c: `${recv.c}.vt->m${idx}(${[`${recv.c}.obj`, ...args].join(', ')})`,
           t: m.ret,
@@ -1231,11 +1839,12 @@ export class CodeGen {
       }
 
       if (this.isObj(recv.t)) {
-        const found = this.findMethodWithOwner(this.objName(recv.t), name)
-        if (found === null) throw new Unsupported(`方法「${name}」`)
+        const list = this.findMethodsWithOwner(this.objName(recv.t), name)
+        const found = list.length > 1 ? list[e.overload ?? 0] : list[0]
+        if (found === undefined) throw new Unsupported(`方法「${name}」`)
         const m = found.method
         this.checkAccess(m.vis, found.owner, '方法', m.name)
-        const args = this.callArgs(e.args, m.params)
+        const args = this.callArgsWithDefaults(this.orderedRaw(e.args, m.raw.params, m.defaults, `方法「${m.name}」`), m.params, m.defaults, m.modes)
         if (m.isStatic) return { c: `${m.cn}(${args.join(', ')})`, t: m.ret }
         const mods = m.raw.modifiers as string[]
         if (e.callee.target.kind === 'base' && mods.includes('抽象')) {
@@ -1245,6 +1854,47 @@ export class CodeGen {
           return { c: `Csay_dispatch_${name}(${[this.objPtr(recv), ...args].join(', ')})`, t: m.ret }
         }
         return { c: `${m.cn}(${[this.objPtr(recv), ...args].join(', ')})`, t: m.ret }
+      }
+
+      if (this.isArray(recv.t)) {
+        const elem = recv.t.slice(0, -2)
+        const field = this.isArrayField(e.callee.target)
+        if (!field && e.callee.target.kind !== 'name') throw new Unsupported('数组添加、删除、插入只支持数组变量或字段')
+        const arr = recv.c
+        const elemC = this.cType(elem)
+        const slot = field ? this.fresh('slot') : null
+        const arrLen = field ? this.fresh('len') : `${recv.c}_len`
+        const prelude = field
+          ? `${this.cType(recv.t)}* ${slot} = &(${arr}); CsayInt ${arrLen} = csay_array_len(*${slot});`
+          : ''
+        const arrPtr = field ? `(void**)${slot}` : `(void**)&${arr}`
+        if (name === '添加') {
+          const v = this.expr(e.args[0])
+          const x = this.fresh('v')
+          return {
+            c: `({ ${this.cType(elem)} ${x} = ${v.c}; ${prelude} csay_array_append(${arrPtr}, &${arrLen}, sizeof(${elemC}), &${x}); 0LL; })`,
+            t: '无',
+          }
+        }
+        if (name === '删除') {
+          const at = this.expr(e.args[0])
+          const i = this.fresh('i')
+          return {
+            c: `({ CsayInt ${i} = ${at.c}; ${prelude} csay_array_remove(${arrPtr}, &${arrLen}, sizeof(${elemC}), ${i}); 0LL; })`,
+            t: '无',
+          }
+        }
+        if (name === '插入') {
+          const at = this.expr(e.args[0])
+          const v = this.expr(e.args[1])
+          const i = this.fresh('i')
+          const x = this.fresh('v')
+          return {
+            c: `({ CsayInt ${i} = ${at.c}; ${this.cType(elem)} ${x} = ${v.c}; ${prelude} csay_array_insert(${arrPtr}, &${arrLen}, sizeof(${elemC}), ${i}, &${x}); 0LL; })`,
+            t: '无',
+          }
+        }
+        throw new Unsupported(`数组的方法「${name}」`)
       }
 
       if (recv.t.startsWith('列表:')) {
@@ -1270,32 +1920,60 @@ export class CodeGen {
         if (name === '清空') {
           return { c: `(csay_list_clear(${recv.c}), 0LL)`, t: '无' }
         }
+        if (name === '含') {
+          const v = this.expr(e.args[0])
+          const fn = elem === '整数'
+            ? 'csay_list_index_int'
+            : elem === '浮点数'
+              ? 'csay_list_index_float32'
+              : elem === '长小数'
+                ? 'csay_list_index_float'
+                : elem === '文本'
+                  ? 'csay_list_index_str'
+                  : null
+          if (fn === null) throw new Unsupported(`列表包含（元素类型 ${elem}）`)
+          return { c: `${fn}(${recv.c}, ${v.c}) >= 0`, t: '真假' }
+        }
         if (name === '查找') {
           const v = this.expr(e.args[0])
           const fn = elem === '整数'
             ? `csay_list_index_int(${recv.c}, ${v.c})`
-            : elem === '小数'
-              ? `csay_list_index_float(${recv.c}, ${v.c})`
-              : elem === '文本'
-                ? `csay_list_index_str(${recv.c}, ${v.c})`
-                : null
+            : elem === '浮点数'
+              ? `csay_list_index_float32(${recv.c}, ${v.c})`
+              : elem === '长小数'
+                ? `csay_list_index_float(${recv.c}, ${v.c})`
+                : elem === '文本'
+                  ? `csay_list_index_str(${recv.c}, ${v.c})`
+                  : null
           if (fn === null) throw new Unsupported(`列表查找（元素类型 ${elem}）`)
           return { c: fn, t: '整数' }
         }
         if (name === '排序') {
           const fn = elem === '整数'
             ? 'csay_cmp_int'
-            : elem === '小数'
-              ? 'csay_cmp_float'
-              : elem === '文本'
-                ? 'csay_cmp_str'
-                : null
+            : elem === '浮点数'
+              ? 'csay_cmp_float32'
+              : elem === '长小数'
+                ? 'csay_cmp_float'
+                : elem === '文本'
+                  ? 'csay_cmp_str'
+                  : null
           if (fn === null) throw new Unsupported(`列表排序（元素类型 ${elem}）`)
           return { c: `(csay_list_sort(${recv.c}, ${fn}), 0LL)`, t: '无' }
         }
-        if (name === '最大') {
-          if (elem !== '整数') throw new Unsupported('列表的最大值（仅整数）')
-          return { c: `csay_list_max_int(${recv.c})`, t: '整数' }
+        if (name === '最大' || name === '最小') {
+          const suffix = elem === '整数'
+            ? 'int'
+            : elem === '浮点数'
+              ? 'float32'
+              : elem === '长小数'
+                ? 'float'
+                : elem === '文本'
+                  ? 'str'
+                  : null
+          if (suffix === null) throw new Unsupported(`列表的${name}值（元素类型 ${elem}）`)
+          const fn = `csay_list_${name === '最大' ? 'max' : 'min'}_${suffix}`
+          return { c: `${fn}(${recv.c})`, t: elem }
         }
         if (name === '反转') {
           return { c: `(csay_list_reverse(${recv.c}), 0LL)`, t: '无' }
@@ -1308,23 +1986,27 @@ export class CodeGen {
         if (name === '去重') {
           const fn = elem === '整数'
             ? 'csay_list_unique_int'
-            : elem === '小数'
-              ? 'csay_list_unique_float'
-              : elem === '文本'
-                ? 'csay_list_unique_str'
-                : null
+            : elem === '浮点数'
+              ? 'csay_list_unique_float32'
+              : elem === '长小数'
+                ? 'csay_list_unique_float'
+                : elem === '文本'
+                  ? 'csay_list_unique_str'
+                  : null
           if (fn === null) throw new Unsupported(`列表去重（元素类型 ${elem}）`)
           return { c: `(${fn}(${recv.c}), 0LL)`, t: '无' }
         }
         const simple = elem === '整数'
           ? 'int'
-          : elem === '小数'
-            ? 'float'
-            : elem === '文本'
-              ? 'str'
-              : elem === '真假'
-                ? 'bool'
-                : null
+          : elem === '浮点数'
+            ? 'float32'
+            : elem === '长小数'
+              ? 'float'
+              : elem === '文本'
+                ? 'str'
+                : elem === '真假'
+                  ? 'bool'
+                  : null
         if (name === '集合添加') {
           if (simple === null) throw new Unsupported(`集合添加（元素类型 ${elem}）`)
           const v = this.expr(e.args[0])
@@ -1395,7 +2077,8 @@ export class CodeGen {
         if (name === '转小写') return { c: `csay_str_lower(${recv.c})`, t: '文本' }
         if (name === '去除空白') return { c: `csay_str_trim(${recv.c})`, t: '文本' }
         if (name === '转整数') return { c: `csay_str_to_int(${recv.c})`, t: '整数' }
-        if (name === '转小数') return { c: `csay_str_to_float(${recv.c})`, t: '小数' }
+        if (name === '转长小数') return { c: `csay_str_to_float(${recv.c})`, t: '长小数' }
+        if (name === '转浮点数') return { c: `csay_str_to_float32(${recv.c})`, t: '浮点数' }
         throw new Unsupported(`文本的方法「${name}」`)
       }
       throw new Unsupported(`这个类型的方法「${name}」`)
@@ -1405,6 +2088,9 @@ export class CodeGen {
     const name = e.callee.name
 
     if (name === '打印') throw new Unsupported('打印 只能作为语句使用')
+    if (name === '回收') return { c: '(csay_gc_collect(), 0LL)', t: '无' }
+    if (name === '内存块数') return { c: 'csay_gc_block_count', t: '整数' }
+    if (name === '内存字节数') return { c: 'csay_gc_bytes', t: '整数' }
     if (name === '退出') {
       const a = e.args[0] === undefined ? { c: '0', t: '整数' } : this.expr(e.args[0])
       return { c: `(csay_exit(${a.c}), 0LL)`, t: '无' }
@@ -1413,8 +2099,17 @@ export class CodeGen {
     if (name === '当前时间') return { c: 'csay_now()', t: '文本' }
     if (name === '当前日期') return { c: 'csay_today()', t: '文本' }
     if (name === '时间戳') return { c: 'csay_timestamp()', t: '整数' }
+    if (name === '解析时间') return { c: `csay_parse_time(${this.expr(e.args[0]).c})`, t: '整数' }
     if (name === '格式化时间') {
-      return { c: `csay_format_time(${this.expr(e.args[0]).c}, ${this.expr(e.args[1]).c})`, t: '文本' }
+      const seconds = this.expr(e.args[0]).c
+      const format = this.expr(e.args[1]).c
+      if (e.args.length >= 3) {
+        return { c: `csay_format_time_zone(${seconds}, ${format}, ${this.expr(e.args[2]).c})`, t: '文本' }
+      }
+      return { c: `csay_format_time(${seconds}, ${format})`, t: '文本' }
+    }
+    if (name === '本地化时间') {
+      return { c: `csay_localized_time(${this.expr(e.args[0]).c}, ${this.expr(e.args[1]).c})`, t: '文本' }
     }
     if (name === '当前目录') return { c: 'csay_current_dir()', t: '文本' }
     if (name === '路径合并') {
@@ -1456,25 +2151,25 @@ export class CodeGen {
       if (msg !== null && msg.t !== '文本') throw new Unsupported('断言() 的消息必须是文本')
       return { c: `(csay_assert(${cond.c}, ${msg === null ? 'csay_lit("")' : msg.c}), 0LL)`, t: '无' }
     }
-    if (name === '开方') return { c: `sqrt((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
-    if (name === '正弦') return { c: `sin((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
-    if (name === '余弦') return { c: `cos((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
-    if (name === '正切') return { c: `tan((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
-    if (name === '反正弦') return { c: `asin((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
-    if (name === '反余弦') return { c: `acos((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
-    if (name === '反正切') return { c: `atan((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
+    if (name === '开方') return { c: `sqrt((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
+    if (name === '正弦') return { c: `sin((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
+    if (name === '余弦') return { c: `cos((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
+    if (name === '正切') return { c: `tan((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
+    if (name === '反正弦') return { c: `asin((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
+    if (name === '反余弦') return { c: `acos((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
+    if (name === '反正切') return { c: `atan((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
     if (name === '反正切2') {
       const y = this.expr(e.args[0])
       const x = this.expr(e.args[1])
-      return { c: `atan2((double)(${y.c}), (double)(${x.c}))`, t: '小数' }
+      return { c: `atan2((double)(${y.c}), (double)(${x.c}))`, t: '长小数' }
     }
-    if (name === '自然对数') return { c: `log((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
-    if (name === '常用对数') return { c: `log10((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
-    if (name === '指数') return { c: `exp((double)(${this.expr(e.args[0]).c}))`, t: '小数' }
+    if (name === '自然对数') return { c: `log((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
+    if (name === '常用对数') return { c: `log10((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
+    if (name === '指数') return { c: `exp((double)(${this.expr(e.args[0]).c}))`, t: '长小数' }
     if (name === '幂') {
       const a = this.expr(e.args[0])
       const b = this.expr(e.args[1])
-      return { c: `pow((double)(${a.c}), (double)(${b.c}))`, t: '小数' }
+      return { c: `pow((double)(${a.c}), (double)(${b.c}))`, t: '长小数' }
     }
     if (name === '向下取整') return { c: `(int64_t)floor((double)(${this.expr(e.args[0]).c}))`, t: '整数' }
     if (name === '向上取整') return { c: `(int64_t)ceil((double)(${this.expr(e.args[0]).c}))`, t: '整数' }
@@ -1486,12 +2181,16 @@ export class CodeGen {
     if (name === '最大' || name === '最小') {
       const a = this.expr(e.args[0])
       const b = this.expr(e.args[1])
-      const rt = a.t === '小数' || b.t === '小数' ? '小数' : '整数'
+      const rt = a.t === '长小数' || b.t === '长小数'
+        ? '长小数'
+        : a.t === '浮点数' || b.t === '浮点数'
+          ? '浮点数'
+          : '整数'
       const op = name === '最大' ? '>' : '<'
       return { c: `((${a.c}) ${op} (${b.c}) ? (${a.c}) : (${b.c}))`, t: rt }
     }
-    if (name === '圆周率') return { c: '3.14159265358979323846', t: '小数' }
-    if (name === '随机') return { c: 'csay_random()', t: '小数' }
+    if (name === '圆周率') return { c: '3.14159265358979323846', t: '长小数' }
+    if (name === '随机') return { c: 'csay_random()', t: '长小数' }
     if (name === '随机整数') {
       const a = this.expr(e.args[0])
       const b = this.expr(e.args[1])
@@ -1516,10 +2215,10 @@ export class CodeGen {
       const sep = this.expr(e.args[1])
       return { c: `csay_join(${l.c}, ${sep.c})`, t: '文本' }
     }
-    if (name === '格式化小数') {
+    if (name === '格式化浮点') {
       const v = this.expr(e.args[0])
       const d = this.expr(e.args[1])
-      return { c: `csay_format_float(${v.c}, ${d.c})`, t: '文本' }
+      return { c: `csay_format_float((CsayFloat)(${v.c}), ${d.c})`, t: '文本' }
     }
     if (name === '格式化') {
       const f = this.expr(e.args[0])
@@ -1554,38 +2253,74 @@ export class CodeGen {
       const r = this.expr(e.args[2])
       return { c: `csay_regex_replace(${s.c}, ${p.c}, ${r.c})`, t: '文本' }
     }
-    if (name === 'JSON文本') return { c: `csay_json_text(${this.expr(e.args[0]).c})`, t: '文本' }
+    if (name === 'JSON字符串') return { c: `csay_json_text(${this.expr(e.args[0]).c})`, t: '文本' }
     if (name === 'JSON解析') {
       const s = this.expr(e.args[0])
       if (s.t !== '文本') throw new Unsupported('JSON解析() 的参数必须是文本')
       return { c: `csay_json_parse(${s.c})`, t: '表:文本:文本' }
     }
+    if (name === 'JSON取值') {
+      const s = this.expr(e.args[0])
+      const p = this.expr(e.args[1])
+      if (s.t !== '文本' || p.t !== '文本') throw new Unsupported('JSON取值() 的两个参数都必须是文本')
+      return { c: `csay_json_get(${s.c}, ${p.c})`, t: '文本' }
+    }
+    if (name === 'JSON设置') {
+      const s = this.expr(e.args[0])
+      const p = this.expr(e.args[1])
+      const v = this.expr(e.args[2])
+      if (s.t !== '文本' || p.t !== '文本' || v.t !== '文本') throw new Unsupported('JSON设置() 的三个参数都必须是文本')
+      return { c: `csay_json_set(${s.c}, ${p.c}, ${v.c})`, t: '文本' }
+    }
     if (name === 'JSON序列化') {
       const v = this.expr(e.args[0])
       if (v.t === '文本') return { c: `csay_json_text(${v.c})`, t: '文本' }
-      if (v.t === '整数') return { c: `csay_str_of_int(${v.c})`, t: '文本' }
-      if (v.t === '小数') return { c: `csay_str_of_float(${v.c})`, t: '文本' }
+      if (v.t === '字符') return { c: `csay_json_text(csay_char_of_code(${v.c}))`, t: '文本' }
+      if (isIntegerType(v.t)) return { c: `csay_str_of_int(${v.c})`, t: '文本' }
+      if (v.t === '浮点数') return { c: `csay_str_of_float32(${v.c})`, t: '文本' }
+      if (v.t === '长小数') return { c: `csay_str_of_float(${v.c})`, t: '文本' }
       if (v.t === '真假') return { c: `csay_json_bool(${v.c})`, t: '文本' }
+      if (v.t.endsWith('[]')) {
+        const base = v.t.slice(0, -2)
+        const simple = e.args[0].kind === 'name'
+        if (base === '字符' && simple) return { c: `csay_json_any(${v.c}, ${v.c}_len, (int64_t)sizeof(*${v.c}), "ac")`, t: '文本' }
+        const kind = base === '文本' ? 0 : isIntegerType(base) ? 1 : base === '长小数' ? 2 : base === '真假' ? 3 : base === '浮点数' ? 4 : -1
+        if (kind >= 0 && simple) return { c: `csay_json_array(${v.c}, ${v.c}_len, ${kind})`, t: '文本' }
+      }
       if (v.t === '列表:文本') return { c: `csay_json_list(${v.c}, 0)`, t: '文本' }
-      if (v.t === '列表:整数') return { c: `csay_json_list(${v.c}, 1)`, t: '文本' }
-      if (v.t === '列表:小数') return { c: `csay_json_list(${v.c}, 2)`, t: '文本' }
+      if (v.t === '列表:字符') return { c: this.withTemp(v.t, v.c, (x) => `csay_json_any(&${x}, 0, 0, "lc")`), t: '文本' }
+      if (v.t.startsWith('列表:') && isIntegerType(v.t.slice(3))) return { c: `csay_json_list(${v.c}, 1)`, t: '文本' }
+      if (v.t === '列表:浮点数') return { c: `csay_json_list(${v.c}, 4)`, t: '文本' }
+      if (v.t === '列表:长小数') return { c: `csay_json_list(${v.c}, 2)`, t: '文本' }
       if (v.t === '列表:真假') return { c: `csay_json_list(${v.c}, 3)`, t: '文本' }
+      if (v.t === '表:文本:文本') return { c: `csay_json_map(${v.c}, 0)`, t: '文本' }
+      if (v.t === '表:文本:字符') return { c: this.withTemp(v.t, v.c, (x) => `csay_json_any(&${x}, 0, 0, "msc")`), t: '文本' }
+      if (v.t.startsWith('表:文本:') && isIntegerType(v.t.slice(5))) return { c: `csay_json_map(${v.c}, 1)`, t: '文本' }
+      if (v.t === '表:文本:长小数') return { c: `csay_json_map(${v.c}, 2)`, t: '文本' }
+      if (v.t === '表:文本:真假') return { c: `csay_json_map(${v.c}, 3)`, t: '文本' }
+      if (v.t === '表:文本:浮点数') return { c: `csay_json_map(${v.c}, 4)`, t: '文本' }
+      const desc = this.jsonDesc(v.t)
+      if (desc !== null) {
+        return { c: this.withTemp(v.t, v.c, (x) => `csay_json_any(&${x}, 0, 0, "${desc}")`), t: '文本' }
+      }
       throw new Unsupported(`JSON序列化() 暂不支持「${v.t}」`)
     }
     if (name === '字符') return { c: `csay_char_of_code(${this.expr(e.args[0]).c})`, t: '文本' }
-    if (name === '保留') {
+    if (name === '移出区域') {
       const a = this.expr(e.args[0])
-      if (a.t !== '文本') throw new Unsupported('保留() 目前只支持文本')
+      if (a.t !== '文本') throw new Unsupported('移出区域() 目前只支持文本')
       return { c: `csay_keep_str(${a.c})`, t: '文本' }
     }
     if (name === '输入') return { c: 'csay_read_line()', t: '文本' }
     if (name === '询问') return { c: 'csay_ask(' + this.expr(e.args[0]).c + ')', t: '文本' }
     if (name === '转整数') return { c: 'csay_str_to_int(' + this.expr(e.args[0]).c + ')', t: '整数' }
-    if (name === '转小数') return { c: 'csay_str_to_float(' + this.expr(e.args[0]).c + ')', t: '小数' }
-    if (name === '取整') return { c: `csay_round(${this.expr(e.args[0]).c})`, t: '整数' }
+    if (name === '转长小数') return { c: 'csay_str_to_float(' + this.expr(e.args[0]).c + ')', t: '长小数' }
+    if (name === '转浮点数') return { c: 'csay_str_to_float32(' + this.expr(e.args[0]).c + ')', t: '浮点数' }
+    if (name === '四舍五入') return { c: `csay_round(${this.expr(e.args[0]).c})`, t: '整数' }
     if (name === '绝对值') {
       const a = this.expr(e.args[0])
-      return { c: `fabs((double)(${a.c}))`, t: '小数' }
+      if (a.t === '浮点数') return { c: `fabsf(${a.c})`, t: '浮点数' }
+      return { c: `fabs((double)(${a.c}))`, t: '长小数' }
     }
     if (name === '写文件') {
       const p = this.expr(e.args[0])
@@ -1599,12 +2334,13 @@ export class CodeGen {
     }
     if (name === '抛出') return { c: `(${this.throwValue(this.expr(e.args[0]))}, 0LL)`, t: '无' }
 
-    const sig = this.funcs.get(name)
-    if (sig === undefined) {
+    const list = this.funcs.get(name)
+    if (list === undefined) {
       if (this.selfType !== null && this.classMethods !== null) {
-        const m = this.classMethods.get(name)
+        const overloads = this.classMethods.get(name)
+        const m = overloads === undefined ? undefined : overloads.length > 1 ? overloads[e.overload ?? 0] : overloads[0]
         if (m !== undefined) {
-          const args = this.callArgs(e.args, m.params)
+          const args = this.callArgsWithDefaults(this.orderedArgs(e.args, m.paramNames, m.defaults, `方法「${m.name}」`), m.params, m.defaults, m.modes)
           const call = `${m.cn}(self${args.length > 0 ? ', ' + args.join(', ') : ''})`
           if (m.ret === '无') return { c: `(${call}, 0LL)`, t: '整数' }
           return { c: call, t: m.ret }
@@ -1612,7 +2348,18 @@ export class CodeGen {
       }
       throw new Unsupported(`函数「${name}」`)
     }
-    const args = this.callArgs(e.args, sig.params)
+    let sig: FuncInfo
+    if (list.length === 1) {
+      sig = list[0]
+    } else if (e.overload !== undefined && list[e.overload] !== undefined) {
+      sig = list[e.overload]
+    } else {
+      if (e.args.some((a) => a.kind === 'named')) throw new Unsupported(`重载函数「${name}」的命名参数`)
+      const matches = list.filter((s) => s.params.length === e.args.length)
+      if (matches.length !== 1) throw new Unsupported(`重载函数「${name}」`)
+      sig = matches[0]
+    }
+    const args = this.callArgsWithDefaults(this.orderedArgs(e.args, sig.paramNames, sig.defaults, `函数「${name}」`), sig.params, sig.defaults, sig.modes)
     return { c: `${sig.cn}(${args.join(', ')})`, t: sig.ret }
   }
 
@@ -1672,7 +2419,7 @@ export class CodeGen {
           } else if (s.init.kind === 'expr') {
             init = this.expr(s.init.expr).c
           } else {
-            throw new Unsupported('对于 的第一段')
+            throw new Unsupported('循环 的第一段')
           }
         }
         const cond = s.cond === null ? '' : this.expr(s.cond).c
@@ -1716,21 +2463,28 @@ export class CodeGen {
         if (m.params.length !== 0) throw new Unsupported('关闭 方法不能带参数')
         this.checkAccess(m.vis, found.owner, '方法', m.name)
         const mods = m.raw.modifiers as string[]
-        const ptr = this.objPtr(recv)
-        const close = mods.includes('虚拟') || mods.includes('覆盖') || mods.includes('抽象')
+        const ptr = this.fresh('use_target')
+        const target = this.objPtr(recv)
+        const closeCall = mods.includes('虚拟') || mods.includes('覆盖') || mods.includes('抽象')
           ? `Csay_dispatch_关闭(${ptr})`
           : `${m.cn}(${ptr})`
+        const close = `if (${ptr} != NULL) { ${closeCall}; }`
         const id = this.fresh('use')
+        const closed = `${id}_closed`
         this.push('{')
         this.indent++
+        this.push(`${this.cType(recv.t)} ${ptr} = ${target};`)
         this.push(`CsayTry ${id};`)
         this.push(`int ${id}_failed = 0;`)
+        this.push(`int ${closed} = 0;`)
         this.push(`${id}.prev = csay_try_top;`)
         this.push(`if (setjmp(${id}.buf) == 0) {`)
         this.indent++
         this.push(`csay_try_top = &${id};`)
         this.usingDepth++
+        this.usingStack.push({ close, closed, loopDepth: this.loopDepth })
         for (const st of (s.body as Extract<Stmt, { kind: 'block' }>).stmts) this.stmt(st)
+        this.usingStack.pop()
         this.usingDepth--
         this.push(`csay_try_top = ${id}.prev;`)
         this.indent--
@@ -1738,11 +2492,11 @@ export class CodeGen {
         this.indent++
         this.push(`${id}_failed = 1;`)
         this.push(`csay_try_top = ${id}.prev;`)
-        this.push(`${close};`)
+        this.push(`if (!${closed}) { ${close}; }`)
         this.push(`csay_throw_error(${id}.err);`)
         this.indent--
         this.push('}')
-        this.push(`${close};`)
+        this.push(`if (!${closed}) { ${close}; }`)
         this.indent--
         this.push('}')
         return
@@ -1751,17 +2505,28 @@ export class CodeGen {
         this.push(`${this.throwValue(this.expr(s.value))};`)
         return
       case 'return': {
-        if (this.lambdaVoidBlock) throw new Unsupported('Lambda 块体暂不支持 返回；请改用表达式体')
-        if (this.usingDepth > 0) throw new Unsupported('使用 块里不能 返回')
         if (s.value === null) {
+          for (const u of [...this.usingStack].reverse()) {
+            this.push(`${u.closed} = 1;`)
+            this.push(`${u.close};`)
+          }
           for (const r of [...this.regionStack].reverse()) this.push(`csay_region_end(${r.id});`)
           this.push('return;')
           return
         }
         const v = this.expr(s.value)
         let retExpr = this.coerce(v, this.currentRet ?? v.t)
+        if (this.usingStack.length > 0 || this.regionStack.length > 0) {
+          const ret = this.fresh('ret')
+          this.push(`${this.cType(this.currentRet ?? v.t)} ${ret} = ${retExpr};`)
+          retExpr = ret
+        }
+        for (const u of [...this.usingStack].reverse()) {
+          this.push(`${u.closed} = 1;`)
+          this.push(`${u.close};`)
+        }
         if (this.regionStack.length > 0) {
-          const scalar = v.t === '整数' || v.t === '小数' || v.t === '真假' || v.t.startsWith('枚举:')
+          const scalar = v.t === '整数' || v.t === '浮点数' || v.t === '长小数' || v.t === '真假' || v.t.startsWith('枚举:')
           if (scalar) {
             // 值拷贝，直接放行
           } else if (v.t === '文本') {
@@ -1782,7 +2547,11 @@ export class CodeGen {
       }
       case 'break':
       case 'continue': {
-        if (this.usingDepth > 0) throw new Unsupported('使用 块里不能 跳出 或 跳过')
+        const exitingUsing = this.usingStack.filter((u) => u.loopDepth >= this.loopDepth)
+        for (const u of [...exitingUsing].reverse()) {
+          this.push(`${u.closed} = 1;`)
+          this.push(`${u.close};`)
+        }
         // 只结束「当前循环体内」的区域：循环外的区域在跳转后仍然有效
         const inner = this.regionStack.filter((r) => r.loopDepth >= this.loopDepth)
         for (const r of [...inner].reverse()) this.push(`csay_region_end(${r.id});`)
@@ -1803,9 +2572,19 @@ export class CodeGen {
     }
     if (t.startsWith('结构:') && s.init !== null && s.init.kind === 'new') {
       const info = this.typeInfo(t)
-      const ctor = info.ctors.find((c) => c.params.length === s.init!.args.length)
+      let ctor: CtorInfo | undefined
+      let ordered: Expr[] = []
+      for (const c of info.ctors) {
+        const r = arrangeArguments(s.init.args, c.raw.params.map((p: Param) => p.name), c.defaults)
+        if (r.error !== undefined) continue
+        if (r.args.length < c.minArgs || r.args.length > c.params.length) continue
+        ctor = c
+        ordered = r.args
+        break
+      }
       if (ctor === undefined) throw new Unsupported(`${info.name} 没有匹配的构造器`)
-      const args = s.init.args.map((a) => this.expr(a).c)
+      this.checkCtorAccess(ctor, info.name)
+      const args = this.callArgsWithDefaults(ordered, ctor.params, ctor.defaults, ctor.modes, true)
       this.push(`${cn} = ${ctor.cn}(${args.join(', ')});`)
       return
     }
@@ -1818,11 +2597,27 @@ export class CodeGen {
     const cn = this.cname(s.name)
 
     if (this.isArray(t)) {
-      if (s.init === null || s.init.kind !== 'array') throw new Unsupported('数组只能用字面量初始化')
+      if (s.init === null || s.init.kind === 'null') {
+        this.push(`${this.cType(t)} ${cn} = NULL;`)
+        this.push(`CsayInt ${cn}_len = 0;`)
+        this.declareVar(s.name, t)
+        return
+      }
+      if (s.init.kind !== 'array') {
+        const v = this.expr(s.init)
+        if (!this.isArray(v.t)) throw new Unsupported('数组只能用字面量、另一个数组或 空 初始化')
+        const tmp = this.fresh('arr')
+        this.push(`${this.cType(t)} ${tmp} = ${this.coerce(v, t)};`)
+        this.push(`${this.cType(t)} ${cn} = ${tmp};`)
+        this.push(`CsayInt ${cn}_len = csay_array_len(${tmp});`)
+        this.declareVar(s.name, t)
+        return
+      }
       if (s.init.elems.length === 0) throw new Unsupported('空数组字面量')
       const elem = t.slice(0, -2)
       const items = s.init.elems.map((x) => this.coerce(this.expr(x), elem))
-      this.push(`${this.cType(elem)} ${cn}[${items.length}] = {${items.join(', ')}}; /* ${s.name} */`)
+      this.push(`${this.cType(t)} ${cn} = (${this.cType(t)})csay_array_alloc(${items.length}, (int64_t)sizeof(${this.cType(elem)})); /* ${s.name} */`)
+      items.forEach((x, i) => this.push(`${cn}[${i}] = ${x};`))
       this.push(`CsayInt ${cn}_len = ${items.length};`)
       this.declareVar(s.name, t)
       return
@@ -1830,9 +2625,10 @@ export class CodeGen {
 
     if (t.startsWith('结构:') && s.init !== null && s.init.kind === 'new') {
       const info = this.typeInfo(t)
-      const ctor = info.ctors.find((c) => c.params.length === s.init!.args.length)
+      const ctor = info.ctors.find((c) => s.init!.args.length >= c.minArgs && s.init!.args.length <= c.params.length)
       if (ctor === undefined) throw new Unsupported(`${info.name} 没有匹配的构造器`)
-      const args = s.init.args.map((a) => this.expr(a).c)
+      this.checkCtorAccess(ctor, info.name)
+      const args = this.callArgsWithDefaults(s.init.args, ctor.params, ctor.defaults, ctor.modes, true)
       this.push(`${this.cType(t)} ${cn}; /* ${s.name} */`)
       this.push(`${ctor.initCn}(${['&' + cn, ...args].join(', ')});`)
       this.declareVar(s.name, t)
@@ -1851,14 +2647,22 @@ export class CodeGen {
   private exprStmt(e: Expr): void {
     if (e.kind === 'call' && e.callee.kind === 'name' && e.callee.name === '打印') {
       if (e.args.length !== 1) throw new Unsupported('打印 需要正好一个参数')
+      if (e.args[0].kind === 'null') {
+        this.push(`csay_println_str(${strLit('空')});`)
+        return
+      }
       const v = this.expr(e.args[0])
       if (isErrorType(v.t)) { this.push(`csay_println_str(${v.c}.msg);`); return }
       switch (v.t) {
-        case '整数': this.push(`csay_println_int(${v.c});`); return
-        case '小数': this.push(`csay_println_float(${v.c});`); return
+        case '浮点数': this.push(`csay_println_float32(${v.c});`); return
+        case '长小数': this.push(`csay_println_float(${v.c});`); return
         case '文本': this.push(`csay_println_str(${v.c});`); return
+        case '字符': this.push(`csay_println_str(csay_char_of_code(${v.c}));`); return
         case '真假': this.push(`csay_println_bool(${v.c});`); return
+        case '空':
+        case '未知': this.push(`csay_println_str(${strLit('空')});`); return
         default:
+          if (isIntegerType(v.t)) { this.push(`csay_println_int(${v.c});`); return }
           if (v.t.startsWith('枚举:')) { this.push(`csay_println_int(${v.c});`); return }
           throw new Unsupported('打印这种值')
       }
@@ -1903,7 +2707,7 @@ export class CodeGen {
     if (this.isArray(v.t)) {
       const elemType = v.t.slice(0, -2)
       const idx = this.fresh('i')
-      this.push(`for (CsayInt ${idx} = 0; ${idx} < ${v.c}_len; ${idx}++)`)
+      this.push(`for (CsayInt ${idx} = 0; ${idx} < ${this.arrayLenOf(s.iter, v)}; ${idx}++)`)
       this.push('{')
       this.indent++
       this.enter()
@@ -1937,7 +2741,7 @@ export class CodeGen {
 
   private switchStmt(s: Extract<Stmt, { kind: 'switch' }>): void {
     const subj = this.expr(s.subject)
-    if (subj.t !== '整数' && !subj.t.startsWith('枚举:')) throw new Unsupported('择 只支持整数或枚举')
+    if (subj.t !== '整数' && !subj.t.startsWith('枚举:')) throw new Unsupported('选择 只支持整数或枚举')
     this.push(`switch (${subj.c}) {`)
     this.indent++
     for (const c of s.clauses) {
@@ -1982,14 +2786,24 @@ export class CodeGen {
     this.indent++
     this.push(`${id}_failed = 1;`)
     this.push(`csay_try_top = ${id}.prev;`)
+    const declaredCatches = new Set<string>()
+    s.catches.forEach((c) => {
+      if (declaredCatches.has(c.name)) return
+      declaredCatches.add(c.name)
+      this.push(`CsayError ${this.cname(c.name)} = ${id}.err; /* ${c.name} */`)
+    })
     s.catches.forEach((c, i) => {
       const kind = this.catchKind(c.type)
-      const cond = kind === 0 ? '1' : `${id}.err.kind == ${kind}`
+      const cn = this.cname(c.name)
+      this.enter()
+      this.declareVar(c.name, '异常')
+      const filter = c.filter === undefined || c.filter === null ? null : this.expr(c.filter).c
+      this.leave()
+      const typeCond = kind === 0 ? '1' : `${id}.err.kind == ${kind}`
+      const cond = filter === null ? typeCond : `(${typeCond}) && (${filter})`
       this.push(`${i === 0 ? 'if' : 'else if'} (${cond}) {`)
       this.indent++
       this.push(`${id}_handled = 1;`)
-      const cn = this.cname(c.name)
-      this.push(`CsayError ${cn} = ${id}.err; /* ${c.name} */`)
       this.enter()
       this.declareVar(c.name, '异常')
       for (const st of (c.body as Extract<Stmt, { kind: 'block' }>).stmts) this.stmt(st)
@@ -2020,18 +2834,30 @@ export class CodeGen {
     this.collect(unit)
 
     const localFuncs = unit.stmts.filter((s): s is Extract<Stmt, { kind: 'localFunc' }> => s.kind === 'localFunc')
+    const localInfos: { f: Extract<Stmt, { kind: 'localFunc' }>; sig: FuncInfo }[] = []
     for (const f of localFuncs) {
-      this.funcs.set(f.name, {
-        cn: `f_${f.name}`,
+      const list = this.funcs.get(f.name) ?? []
+      const index = list.length
+      const sig: FuncInfo = {
+        cn: index === 0 ? `f_${f.name}` : `f_${f.name}__${index + 1}`,
         ret: this.resolveType(f.ret),
         params: f.params.map((p) => this.resolveType(p.type)),
-      })
+        defaults: f.params.map((p) => p.def),
+        minArgs: minArgsOf(f.params),
+        paramNames: f.params.map((p) => p.name),
+        modes: f.params.map((p) => p.mode ?? null),
+      }
+      list.push(sig)
+      this.funcs.set(f.name, list)
+      localInfos.push({ f, sig })
     }
 
     const head: string[] = []
 
     // 顶层变量提升为文件级全局变量：函数体里也能访问。
     const globalDecls: string[] = []
+    const globalRoots: { cn: string; t: string }[] = []
+    const staticRoots: { cn: string; t: string }[] = []
     for (const s of unit.stmts) {
       if (s.kind !== 'var') continue
       const t = this.resolveType(s.type)
@@ -2040,6 +2866,7 @@ export class CodeGen {
       this.globalNames.add(s.name)
       this.declareVar(s.name, t)
       globalDecls.push(`static ${this.cType(t)} ${cn}; /* ${s.name} */`)
+      globalRoots.push({ cn, t: this.cType(t) })
     }
 
     for (const info of this.types.values()) {
@@ -2091,7 +2918,11 @@ export class CodeGen {
     for (const info of this.types.values()) {
       if (info.kind === 'interface' || info.kind === 'enum') continue
       for (const f of info.fields) {
-        if (f.isStatic) head.push(`static ${this.cType(f.type)} ${this.staticFieldCName(info.name, f)};`)
+        if (f.isStatic) {
+          const cn = this.staticFieldCName(info.name, f)
+          head.push(`static ${this.cType(f.type)} ${cn};`)
+          staticRoots.push({ cn, t: this.cType(f.type) })
+        }
       }
     }
     if ([...this.types.values()].some((info) => info.kind !== 'interface' && info.kind !== 'enum' && info.fields.some((f) => f.isStatic))) head.push('')
@@ -2101,7 +2932,7 @@ export class CodeGen {
       if (info.kind !== 'interface') continue
       const slots: string[] = []
       info.ifaceMethods.forEach((m, i) => {
-        const ps = ['void*', ...m.params.map((p) => this.cType(p))].join(', ')
+        const ps = ['void*', ...this.ifaceParamTypes(m)].join(', ')
         slots.push(`    ${this.cType(m.ret)} (*m${i})(${ps});`)
       })
       let slot = info.ifaceMethods.length
@@ -2118,15 +2949,14 @@ export class CodeGen {
     }
 
     const protos: string[] = []
-    for (const f of localFuncs) {
-      const sig = this.funcs.get(f.name)!
-      const ps = sig.params.flatMap((p) => this.paramTypes(p))
+    for (const { sig } of localInfos) {
+      const ps = sig.params.flatMap((p, i) => this.paramTypes(p, sig.modes[i]))
       protos.push(`static ${this.cType(sig.ret)} ${sig.cn}(${ps.length > 0 ? ps.join(', ') : 'void'});`)
     }
     for (const info of this.types.values()) {
       if (info.kind === 'interface' || info.kind === 'enum') continue
       for (const c of info.ctors) {
-        const ps = c.params.map((p) => this.cType(p))
+        const ps = this.ctorParamTypes(c)
         protos.push(`static void ${c.initCn}(${[`${info.cn}* self`, ...ps].join(', ')});`)
         if (info.kind === 'class') {
           protos.push(`static ${info.cn}* ${c.cn}(${ps.length > 0 ? ps.join(', ') : 'void'});`)
@@ -2136,13 +2966,14 @@ export class CodeGen {
       }
       for (const m of info.methods) {
         if (m.raw.body === null) continue
-        const ps = m.params.flatMap((p) => this.paramTypes(p))
+        const ps = m.params.flatMap((p, i) => this.paramTypes(p, m.modes[i]))
         const self = m.isStatic ? [] : [`${info.cn}* self`]
         protos.push(`static ${this.cType(m.ret)} ${m.cn}(${[...self, ...ps].join(', ')});`)
       }
       for (const p of info.props) {
-        if (p.getCn !== null) protos.push(`static ${this.cType(p.type)} ${p.getCn}(${info.cn}* self);`)
-        if (p.setCn !== null) protos.push(`static void ${p.setCn}(${info.cn}* self, ${this.cType(p.type)} _value);`)
+        const self = p.isStatic ? [] : [`${info.cn}* self`]
+        if (p.getCn !== null) protos.push(`static ${this.cType(p.type)} ${p.getCn}(${self.join(', ')});`)
+        if (p.setCn !== null) protos.push(`static void ${p.setCn}(${[...self, `${this.cType(p.type)} _value`].join(', ')});`)
       }
     }
 
@@ -2154,7 +2985,7 @@ export class CodeGen {
         if (!mods.includes('虚拟') && !mods.includes('覆盖') && !mods.includes('抽象')) continue
         const seen = virtualMethods.get(m.name)
         if (seen !== undefined) {
-          if (seen.ret !== m.ret || seen.params.length !== m.params.length || seen.params.some((p, i) => p !== m.params[i])) {
+          if (seen.ret !== m.ret || seen.params.length !== m.params.length || seen.params.some((p, i) => p !== m.params[i]) || seen.modes.some((x, i) => x !== m.modes[i])) {
             throw new Unsupported(`虚方法「${m.name}」在不同类里的签名不一致`)
           }
         } else {
@@ -2163,7 +2994,7 @@ export class CodeGen {
       }
     }
     for (const [name, m] of virtualMethods) {
-      const ps = ['void* self', ...m.params.map((p, i) => `${this.cType(p)} a${i}`)]
+      const ps = ['void* self', ...this.methodParamTypes(m).map((p, i) => `${p} a${i}`)]
       protos.push(`static ${this.cType(m.ret)} Csay_dispatch_${name}(${ps.join(', ')});`)
     }
 
@@ -2192,7 +3023,7 @@ export class CodeGen {
             throw new Unsupported(`类「${info.name}」没有实现接口「${ifaceName}」的方法「${m.name}」`)
           }
           const fn = `Csay_${info.name}_impl_${ifaceName}_m${slot}`
-          const ps = ['void* s', ...m.params.map((p, k) => `${this.cType(p)} a${k}`)]
+          const ps = ['void* s', ...this.ifaceParamTypes(m).map((p, k) => `${p} a${k}`)]
           const args = [`((Csay_${r.owner}*)s)`, ...m.params.map((_, k) => `a${k}`)]
           head.push(`static ${this.cType(m.ret)} ${fn}(${ps.join(', ')}) {`)
           if (m.ret === '无') head.push(`    ${r.method.cn}(${args.join(', ')});`)
@@ -2236,8 +3067,7 @@ export class CodeGen {
 
     const bodies: string[] = []
 
-    for (const f of localFuncs) {
-      const sig = this.funcs.get(f.name)!
+    for (const { f, sig } of localInfos) {
       const ps = this.paramDecls(f.params, sig.params)
       bodies.push(`static ${this.cType(sig.ret)} ${sig.cn}(${ps.length > 0 ? ps.join(', ') : 'void'}) {`)
       bodies.push(...this.bodyOf(f.params, sig.params, (f.body as Extract<Stmt, { kind: 'block' }>).stmts, null, sig.ret))
@@ -2252,22 +3082,43 @@ export class CodeGen {
       for (const c of info.ctors) {
         const node = c.raw
         const params = node.params as Param[]
-        const ps = params.map((p, i) => `${this.cType(c.params[i])} ${this.cname(p.name)} /* ${p.name} */`)
+        const ps = params.map((p, i) => {
+          const isRef = c.modes[i] === 'ref' || c.modes[i] === 'out'
+          return `${isRef ? this.cType(c.params[i]) + '*' : this.cType(c.params[i])} ${isRef ? p.name : this.cname(p.name)} /* ${p.name} */`
+        })
         bodies.push(`static void ${c.initCn}(${[`${info.cn}* self`, ...ps].join(', ')}) {`)
         const saved = this.out
         this.out = []
         this.indent = 1
         this.selfType = selfT
         this.inCtor = true
+        const savedRefs = this.refNames
+        this.refNames = new Map(savedRefs)
         this.enter()
-        params.forEach((p, i) => this.declareVar(p.name, c.params[i]))
+        params.forEach((p, i) => {
+          if (c.modes[i] === 'ref' || c.modes[i] === 'out') this.refNames.set(p.name, `(*${p.name})`)
+          this.declareVar(p.name, c.params[i])
+        })
+        params.forEach((p, i) => {
+          if (this.isArray(c.params[i])) this.push(`CsayInt ${this.cname(p.name)}_len = csay_array_len(${this.cname(p.name)});`)
+        })
         if (info.base !== null) {
           const baseInfo = this.types.get(info.base)!
           const baseArgs = node.baseArgs ?? []
           if (baseInfo.ctors.length > 0) {
-            const baseCtor = baseInfo.ctors.find((x) => x.params.length === baseArgs.length)
+            let baseCtor: CtorInfo | undefined
+            let baseOrdered: Expr[] = []
+            for (const x of baseInfo.ctors) {
+              const r = arrangeArguments(baseArgs as Expr[], x.raw.params.map((p: Param) => p.name), x.defaults)
+              if (r.error !== undefined) continue
+              if (r.args.length < x.minArgs || r.args.length > x.params.length) continue
+              baseCtor = x
+              baseOrdered = r.args
+              break
+            }
             if (baseCtor === undefined) throw new Unsupported('父类没有匹配的构造器')
-            const args = (baseArgs as Expr[]).map((a) => this.expr(a).c)
+            this.checkAccess(baseCtor.vis, info.base, '构造器', info.base)
+            const args = this.callArgsWithDefaults(baseOrdered, baseCtor.params, baseCtor.defaults, baseCtor.modes, true)
             const selfPtr = baseInfo.kind === 'class' ? `((Csay_${info.base}*)self)` : '(&self->base)'
             this.push(`${baseCtor.initCn}(${[selfPtr, ...args].join(', ')});`)
           }
@@ -2284,6 +3135,7 @@ export class CodeGen {
         for (const st of (node.body as Extract<Stmt, { kind: 'block' }>).stmts) this.stmt(st)
         if (info.kind === 'class') this.push(`self->${this.classTagPath(info)} = ${info.tag}LL;`)
         this.leave()
+        this.refNames = savedRefs
         this.inCtor = false
         this.selfType = null
         bodies.push(...this.out)
@@ -2295,7 +3147,7 @@ export class CodeGen {
         if (info.kind === 'class') {
           const ptrs = c.params.map((_p, i) => `p${i}`)
           const decl = c.params.length > 0
-            ? c.params.map((p, i) => `${this.cType(p)} ${ptrs[i]}`).join(', ')
+            ? this.ctorParamTypes(c).map((p, i) => `${p} ${ptrs[i]}`).join(', ')
             : 'void'
           bodies.push(`static ${info.cn}* ${c.cn}(${decl}) {`)
           bodies.push(`    ${info.cn}* self = (${info.cn}*)csay_alloc((int64_t)sizeof(${info.cn}));`)
@@ -2306,7 +3158,7 @@ export class CodeGen {
         } else {
           const ptrs = c.params.map((_p, i) => `p${i}`)
           const decl = c.params.length > 0
-            ? c.params.map((p, i) => `${this.cType(p)} ${ptrs[i]}`).join(', ')
+            ? this.ctorParamTypes(c).map((p, i) => `${p} ${ptrs[i]}`).join(', ')
             : 'void'
           bodies.push(`static ${info.cn} ${c.cn}(${decl}) {`)
           bodies.push(`    ${info.cn} self;`)
@@ -2317,7 +3169,14 @@ export class CodeGen {
         }
       }
 
-            this.classMethods = new Map(info.methods.map((mm) => [mm.name, { ret: mm.ret, params: mm.params, cn: mm.cn }]))
+            const cmap = new Map<string, { name: string; ret: CType; params: CType[]; defaults: (Expr | null)[]; modes: ('ref' | 'out' | null)[]; minArgs: number; cn: string; paramNames: string[] }[]>()
+            for (const mm of info.methods) {
+              const sig = { name: mm.name, ret: mm.ret, params: mm.params, defaults: mm.defaults, modes: mm.modes, minArgs: mm.minArgs, cn: mm.cn, paramNames: mm.raw.params.map((p: Param) => p.name) }
+              const prev = cmap.get(mm.name)
+              if (prev === undefined) cmap.set(mm.name, [sig])
+              else prev.push(sig)
+            }
+            this.classMethods = cmap
 for (const m of info.methods) {
         if (m.raw.body === null) continue
         const node = m.raw
@@ -2329,21 +3188,33 @@ for (const m of info.methods) {
         const savedRet = this.currentRet
         const savedRegion = this.regionStack
     const savedLoop = this.loopDepth
+        const savedUsing = this.usingDepth
+        const savedUsingStack = this.usingStack
         this.out = []
         this.indent = 1
         this.selfType = selfT
         this.currentRet = m.ret
         this.regionStack = []
     this.loopDepth = 0
+        this.usingDepth = 0
+        this.usingStack = []
         this.enter()
+        const savedRefs = this.refNames
+        this.refNames = new Map(savedRefs)
         if (!m.isStatic) this.declareVar('自', selfT)
-        params.forEach((p, i) => this.declareVar(p.name, m.params[i]))
+        params.forEach((p, i) => {
+          this.declareVar(p.name, m.params[i])
+          if (p.mode === 'ref' || p.mode === 'out') this.refNames.set(p.name, `(*${p.name})`)
+        })
         for (const st of (node.body as Extract<Stmt, { kind: 'block' }>).stmts) this.stmt(st)
+        this.refNames = savedRefs
         this.leave()
         this.selfType = null
         this.currentRet = savedRet
         this.regionStack = savedRegion
     this.loopDepth = savedLoop
+        this.usingDepth = savedUsing
+        this.usingStack = savedUsingStack
         bodies.push(...this.out)
         bodies.push('}')
         bodies.push('')
@@ -2353,16 +3224,17 @@ for (const m of info.methods) {
 
       for (const p of info.props) {
         const node = p.raw
-        this.selfType = selfT
+        this.selfType = p.isStatic ? null : selfT
+        const selfParam = p.isStatic ? [] : [`${info.cn}* self`]
         for (const a of node.accessors as Accessor[]) {
           if (a.kind === 'get' && p.getCn !== null) {
-            bodies.push(`static ${this.cType(p.type)} ${p.getCn}(${info.cn}* self) {`)
+            bodies.push(`static ${this.cType(p.type)} ${p.getCn}(${selfParam.join(', ')}) {`)
             bodies.push(...this.bodyOf([], [], (a.body as Extract<Stmt, { kind: 'block' }>).stmts, null, p.type))
             bodies.push('}')
             bodies.push('')
           }
           if (a.kind === 'set' && p.setCn !== null) {
-            bodies.push(`static void ${p.setCn}(${info.cn}* self, ${this.cType(p.type)} _value) {`)
+            bodies.push(`static void ${p.setCn}(${[...selfParam, `${this.cType(p.type)} _value`].join(', ')}) {`)
             bodies.push(...this.bodyOf([], [], (a.body as Extract<Stmt, { kind: 'block' }>).stmts, p.type, '无'))
             bodies.push('}')
             bodies.push('')
@@ -2373,7 +3245,7 @@ for (const m of info.methods) {
     }
 
     for (const [name, sig] of virtualMethods) {
-      const ps = ['void* self', ...sig.params.map((p, i) => `${this.cType(p)} a${i}`)]
+      const ps = ['void* self', ...this.methodParamTypes(sig).map((p, i) => `${p} a${i}`)]
       bodies.push(`static ${this.cType(sig.ret)} Csay_dispatch_${name}(${ps.join(', ')}) {`)
       bodies.push('    switch (((CsayClassHeader*)self)->tag) {')
       let cases = 0
@@ -2387,8 +3259,10 @@ for (const m of info.methods) {
         const args = [`((${this.types.get(found.owner)!.cn}*)self)`, ...sig.params.map((_p, i) => `a${i}`)]
         const call = `${found.method.cn}(${args.join(', ')})`
         bodies.push(`        case ${info.tag}LL:`)
-        if (sig.ret === '无') bodies.push(`            ${call};`)
-        else bodies.push(`            return ${call};`)
+        if (sig.ret === '无') {
+          bodies.push(`            ${call};`)
+          bodies.push('            return;')
+        } else bodies.push(`            return ${call};`)
         cases++
       }
       bodies.push('        default:')
@@ -2402,11 +3276,19 @@ for (const m of info.methods) {
     let hasReturn = false
     for (const s of unit.stmts) if (s.kind === 'return') hasReturn = true
 
+    const staticInitTypes = [...this.types.values()].filter((info) =>
+      info.kind !== 'interface' && info.kind !== 'enum' && info.fields.some((f) => f.isStatic && f.init !== null))
+    bodies.push(...this.staticInitBodies())
     bodies.push('int main(int argc, char** argv) {')
+    bodies.push('    csay_gc_init(&argc);')
+    for (const r of [...globalRoots, ...staticRoots]) {
+      bodies.push(`    csay_gc_add_root(&${r.cn}, (int64_t)sizeof(${r.cn}));`)
+    }
     bodies.push('    csay_win_init();')
     // 用 atexit 保证任何退出路径（顶层 返回、异常、正常结束）都会走收尾
     bodies.push('    atexit(csay_win_finish);')
     bodies.push('    g_csay_argc = argc; g_csay_argv = argv;')
+    for (const info of staticInitTypes) bodies.push(`    ${info.cn}_static_init();`)
     const saved = this.out
     this.out = []
     this.indent = 1
@@ -2443,22 +3325,34 @@ for (const m of info.methods) {
     const savedRet = this.currentRet
     const savedRegion = this.regionStack
     const savedLoop = this.loopDepth
+    const savedUsing = this.usingDepth
+    const savedUsingStack = this.usingStack
     this.out = []
     this.indent = 1
     this.currentRet = retType
     this.regionStack = []
     this.loopDepth = 0
+    this.usingDepth = 0
+    this.usingStack = []
     this.enter()
-    params.forEach((p, i) => this.declareVar(p.name, paramTypes[i]))
+    const savedRefs = this.refNames
+    this.refNames = new Map(savedRefs)
+    params.forEach((p, i) => {
+      if (p.mode === 'ref' || p.mode === 'out') this.refNames.set(p.name, `(*${p.name})`)
+      this.declareVar(p.name, paramTypes[i])
+    })
     if (valueType !== null) this.declareVar('__value__', valueType)
     for (const st of stmts) this.stmt(st)
     this.leave()
+    this.refNames = savedRefs
     const result = this.out
     this.out = saved
     this.indent = savedIndent
     this.currentRet = savedRet
     this.regionStack = savedRegion
     this.loopDepth = savedLoop
+    this.usingDepth = savedUsing
+    this.usingStack = savedUsingStack
     return result
   }
 }

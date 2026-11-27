@@ -1,13 +1,94 @@
 // 编辑器符号索引：转到定义 / 查找引用。
 // 只做名字级索引，不做类型推断；对 Csay 这种中文标识符已经足够实用。
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { resolve, dirname, basename, join } from 'node:path'
 import { parse } from '../src/parser.ts'
 import { tokenize } from '../src/lexer.ts'
+import { serialize, deserialize } from 'node:v8'
 
 const IDENT = /[\p{L}\p{N}_]/u
 const MEMBER_KINDS = new Set(['field', 'method', 'property'])
 const SKIP_DIRS = new Set(['.git', 'build', 'release', 'node_modules', 'codemirror', 'tcc', '.workbuddy'])
+
+// 按文件内容缓存解析结果和词法结果；文件改动后只重新处理改动的文件。
+// 语言服务启动时用 setIndexCache() 指定磁盘缓存，恢复上次的解析结果。
+const unitCache = new Map()
+const tokenCache = new Map()
+const CACHE_VERSION = 1
+let diskPath = ''
+let disk = { version: CACHE_VERSION, files: {} }
+let diskDirty = false
+
+export function setIndexCache(path) {
+  diskPath = path
+  disk = { version: CACHE_VERSION, files: {} }
+  if (!path || !existsSync(path)) return
+  try {
+    const data = deserialize(readFileSync(path))
+    if (data && data.version === CACHE_VERSION) disk = data
+  } catch {
+    disk = { version: CACHE_VERSION, files: {} }
+  }
+}
+
+function fileState(file) {
+  try {
+    const st = statSync(file)
+    return { mtimeMs: st.mtimeMs, size: st.size }
+  } catch {
+    return null
+  }
+}
+
+function diskHit(file) {
+  const entry = disk.files[file]
+  if (!entry) return null
+  const state = fileState(file)
+  if (!state || state.mtimeMs !== entry.mtimeMs || state.size !== entry.size) return null
+  return entry
+}
+
+function diskStore(file, patch) {
+  const state = fileState(file)
+  if (!state) return
+  disk.files[file] = { ...(disk.files[file] || {}), ...state, ...patch }
+  diskDirty = true
+}
+
+function flushIndex() {
+  if (!diskPath || !diskDirty) return
+  mkdirSync(dirname(diskPath), { recursive: true })
+  writeFileSync(diskPath, serialize(disk))
+  diskDirty = false
+}
+
+function cachedUnit(file, text) {
+  const hit = unitCache.get(file)
+  if (hit !== undefined && hit.text === text) return hit.unit
+  const stored = diskHit(file)
+  if (stored?.unit) {
+    unitCache.set(file, { text, unit: stored.unit })
+    return stored.unit
+  }
+  const { unit } = parse(text)
+  unitCache.set(file, { text, unit })
+  diskStore(file, { unit })
+  return unit
+}
+
+function cachedTokens(file, text) {
+  const hit = tokenCache.get(file)
+  if (hit !== undefined && hit.text === text) return hit.tokens
+  const stored = diskHit(file)
+  if (stored?.tokens) {
+    tokenCache.set(file, { text, tokens: stored.tokens })
+    return stored.tokens
+  }
+  const tokens = tokenize(text).tokens
+  tokenCache.set(file, { text, tokens })
+  diskStore(file, { tokens })
+  return tokens
+}
 
 function isIdent(ch) {
   return !!ch && IDENT.test(ch)
@@ -49,6 +130,10 @@ function readLayer(path) {
   }
 }
 
+export function loadProgramSources(entry, source) {
+  return loadLayers(entry, source).map((layer) => ({ path: layer.path, text: layer.source }))
+}
+
 function loadLayers(entry, entrySource) {
   const layers = []
   const seen = new Set()
@@ -58,7 +143,7 @@ function loadLayers(entry, entrySource) {
     seen.add(abs)
     const src = source ?? readLayer(abs)
     if (src === null) return
-    const { unit } = parse(src)
+    const unit = cachedUnit(abs, src)
     layers.push({ path: abs, source: src, unit })
     for (const name of unit.usings) {
       const dep = resolveImport(abs, name)
@@ -66,6 +151,7 @@ function loadLayers(entry, entrySource) {
     }
   }
   visit(entry, entrySource)
+  flushIndex()
   return layers
 }
 
@@ -314,7 +400,7 @@ export function findReferences(entry, source, line, col, workspace) {
   const refs = []
   for (const [file, text] of sources) {
     try {
-      tokenRefs(tokenize(text).tokens, def.name, refs, file, text)
+      tokenRefs(cachedTokens(file, text), def.name, refs, file, text)
     } catch {}
   }
   refs.sort((a, b) => (a.file === resolve(entry) ? -1 : b.file === resolve(entry) ? 1 : 0) || a.line - b.line || a.col - b.col)

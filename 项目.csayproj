@@ -2,5 +2,17 @@
   "name": "Csay",
   "entry": "examples/多文件/主.csay",
   "output": "Csay",
-  "version": "0.1.0"
+  "version": "0.2.0",
+  "exclude": [],
+  "resources": [],
+  "dependencies": [],
+  "beforeBuild": "",
+  "afterBuild": "",
+  "targets": [
+    {
+      "name": "Csay",
+      "entry": "examples/多文件/主.csay",
+      "output": "Csay"
+    }
+  ]
 }

@@ -6,10 +6,11 @@ import type {
   CompilationUnit, Decl, Member, Stmt, Expr, TypeRef, Param, Accessor, StringSeg, CaseClause,
 } from './ast.ts'
 
-const IND = '    '
+let indentUnit = '    '
+let braceStyle: 'same' | 'next' = 'same'
 
 function ind(n: number): string {
-  return IND.repeat(n)
+  return indentUnit.repeat(n)
 }
 
 function typeRef(t: TypeRef): string {
@@ -32,10 +33,22 @@ function stringLit(segs: StringSeg[], interpolated: boolean): string {
   return (interpolated ? '$"' : '"') + body + '"'
 }
 
+function charLit(code: number): string {
+  if (code === 10) return "'\\n'"
+  if (code === 9) return "'\\t'"
+  if (code === 13) return "'\\r'"
+  if (code === 0) return "'\\0'"
+  if (code === 39) return "'\\''"
+  if (code === 92) return "'\\\\'"
+  if (code < 32) return `'\\u${code.toString(16).padStart(4, '0')}'`
+  return `'${String.fromCodePoint(code)}'`
+}
+
 export function expr(e: Expr): string {
   switch (e.kind) {
     case 'int': return e.text
     case 'float': return e.text
+    case 'char': return charLit(e.value)
     case 'string': return stringLit(e.segs, e.interpolated)
     case 'bool': return e.value ? '真' : '假'
     case 'null': return '空'
@@ -49,10 +62,13 @@ export function expr(e: Expr): string {
     case 'assign': return `${expr(e.target)} ${e.op} ${expr(e.value)}`
     case 'cond': return `${expr(e.cond)} ? ${expr(e.then)} : ${expr(e.else)}`
     case 'call': return `${expr(e.callee)}(${e.args.map(expr).join(', ')})`
-    case 'member': return `${expr(e.target)}.${e.name}`
+    case 'named': return `${e.name}: ${expr(e.value)}`
+    case 'byref': return `${e.mode === 'ref' ? '引用' : '输出'} ${expr(e.expr)}`
+    case 'member': return `${expr(e.target)}${e.nullSafe ? '?.' : '.'}${e.name}`
     case 'index': return `${expr(e.target)}[${expr(e.index)}]`
     case 'new': return `新 ${typeRef(e.type)}(${e.args.map(expr).join(', ')})`
     case 'array': return `[${e.elems.map(expr).join(', ')}]`
+    case 'cast': return `(${typeRef(e.type)}) ${expr(e.expr)}`
     case 'paren': return `(${expr(e.expr)})`
     case 'lambda': {
       const body = e.body.kind === 'block' ? blockInline(e.body) : expr(e.body)
@@ -63,7 +79,8 @@ export function expr(e: Expr): string {
 
 function params(list: Param[]): string {
   return list.map((p) => {
-    const base = `${typeRef(p.type)} ${p.name}`
+    const prefix = p.mode === 'ref' ? '引用 ' : p.mode === 'out' ? '输出 ' : ''
+    const base = `${prefix}${typeRef(p.type)} ${p.name}`
     return p.def === null ? base : `${base} = ${expr(p.def)}`
   }).join(', ')
 }
@@ -122,37 +139,37 @@ export function stmt(s: Stmt, depth: number): string {
     case 'empty':
       return `${p};`
     case 'localFunc':
-      return `${p}${typeRef(s.ret)} ${s.name}(${params(s.params)}) ${blockBody(s.body, depth)}`
+      return `${p}${typeRef(s.ret)} ${s.name}(${params(s.params)})${blockBody(s.body, depth)}`
     case 'if': {
-      let out = `${p}若 (${expr(s.cond)}) ${blockBody(s.then, depth)}`
+      let out = `${p}若 (${expr(s.cond)})${blockBody(s.then, depth)}`
       let els = s.els
       while (els !== null) {
         if (els.kind === 'if') {
-          out += ` 否则若 (${expr(els.cond)}) ${blockBody(els.then, depth)}`
+          out += ` 否则若 (${expr(els.cond)})${blockBody(els.then, depth)}`
           els = els.els
         } else {
-          out += ` 否则 ${blockBody(els, depth)}`
+          out += ` 否则${blockBody(els, depth)}`
           els = null
         }
       }
       return out
     }
     case 'while':
-      return `${p}只要 (${expr(s.cond)}) ${blockBody(s.body, depth)}`
+      return `${p}只要 (${expr(s.cond)})${blockBody(s.body, depth)}`
     case 'dowhile':
-      return `${p}做 ${blockBody(s.body, depth)} 只要 (${expr(s.cond)});`
+      return `${p}做${blockBody(s.body, depth)} 只要 (${expr(s.cond)});`
     case 'for': {
       const init = s.init === null ? '' : stmtInline(s.init).replace(/;$/, '')
       const cond = s.cond === null ? '' : expr(s.cond)
       const step = s.step.map(expr).join(', ')
-      return `${p}对于 (${init}; ${cond}; ${step}) ${blockBody(s.body, depth)}`
+      return `${p}循环 (${init}; ${cond}; ${step})${blockBody(s.body, depth)}`
     }
     case 'foreach': {
       const t = s.elemType === null ? '' : typeRef(s.elemType) + ' '
-      return `${p}遍历 (${t}${s.name} 在 ${expr(s.iter)}) ${blockBody(s.body, depth)}`
+      return `${p}遍历 (${t}${s.name} 在 ${expr(s.iter)})${blockBody(s.body, depth)}`
     }
     case 'switch': {
-      const lines = [p + `择 (${expr(s.subject)}) {`]
+      const lines = [p + `选择 (${expr(s.subject)}) {`]
       for (const c of s.clauses) {
         lines.push(...clause(c, depth + 1))
       }
@@ -160,31 +177,32 @@ export function stmt(s: Stmt, depth: number): string {
       return lines.join('\n')
     }
     case 'try': {
-      let out = `${p}试 ${blockBody(s.body, depth)}`
+      let out = `${p}试${blockBody(s.body, depth)}`
       for (const c of s.catches) {
-        out += ` 捕获 (${typeRef(c.type)} ${c.name}) ${blockBody(c.body, depth)}`
+        out += ` 捕获 (${typeRef(c.type)} ${c.name})${c.filter ? ` 若 ${expr(c.filter)}` : ''}${blockBody(c.body, depth)}`
       }
-      if (s.fin !== null) out += ` 最终 ${blockBody(s.fin, depth)}`
+      if (s.fin !== null) out += ` 最终${blockBody(s.fin, depth)}`
       return out
     }
     case 'region':
-      return `${p}区域 ${blockBody(s.body, depth)}`
+      return `${p}区域${blockBody(s.body, depth)}`
     case 'using':
-      return `${p}使用 (${expr(s.target)}) ${blockBody(s.body, depth)}`
+      return `${p}使用 (${expr(s.target)})${blockBody(s.body, depth)}`
   }
 }
 
 function clause(c: CaseClause, depth: number): string[] {
   const p = ind(depth)
-  const head = c.label === null ? `${p}默认:` : `${p}情形 ${expr(c.label)}:`
+  const head = c.label === null ? `${p}默认:` : `${p}情况 ${expr(c.label)}:`
   if (c.stmts.length === 0) return [head]
   return [head, ...c.stmts.map((s) => stmt(s, depth + 1))]
 }
 
 /** 控制语句的体：块直接跟在关键字后，单语句也补成块，保证打印结果可再解析 */
 function blockBody(s: Stmt, depth: number): string {
-  if (s.kind === 'block') return stmt(s, depth).replace(/^\s+/, '')
-  return '{\n' + stmt(s, depth + 1) + '\n' + ind(depth) + '}'
+  const sep = braceStyle === 'next' ? '\n' + ind(depth) : ' '
+  if (s.kind === 'block') return sep + stmt(s, depth).replace(/^\s+/, '')
+  return sep + '{\n' + stmt(s, depth + 1) + '\n' + ind(depth) + '}'
 }
 
 function member(m: Member, depth: number): string {
@@ -192,14 +210,17 @@ function member(m: Member, depth: number): string {
   switch (m.kind) {
     case 'field':
       return `${p}${modifiers(m.modifiers)}${typeRef(m.type)} ${m.name}${m.init === null ? '' : ' = ' + expr(m.init)};`
-    case 'method':
-      return `${p}${modifiers(m.modifiers)}${typeRef(m.ret)} ${m.name}(${params(m.params)}) ${m.body === null ? ';' : blockBody(m.body, depth)}`
+    case 'method': {
+      const body = m.body === null ? ';' : m.exprBody != null ? ` => ${expr(m.exprBody)};` : blockBody(m.body, depth)
+      return `${p}${modifiers(m.modifiers)}${typeRef(m.ret)} ${m.name}(${params(m.params)})${body}`
+    }
     case 'ctor': {
       const base = m.baseArgs === null ? '' : ` : 基(${m.baseArgs.map(expr).join(', ')})`
-      return `${p}${modifiers(m.modifiers)}${m.name}(${params(m.params)})${base} ${blockBody(m.body, depth)}`
+      const body = m.exprBody != null ? ` => ${expr(m.exprBody)};` : blockBody(m.body, depth)
+      return `${p}${modifiers(m.modifiers)}${m.name}(${params(m.params)})${base}${body}`
     }
     case 'prop':
-      return `${p}${modifiers(m.modifiers)}${typeRef(m.type)} ${m.name} { ${accessors(m.accessors)} }`
+      return `${p}${modifiers(m.modifiers)}${typeRef(m.type)} ${m.name} ${m.exprBody != null ? `=> ${expr(m.exprBody)};` : `{ ${accessors(m.accessors)} }`}`
     case 'ifaceMethod':
       return `${p}${typeRef(m.ret)} ${m.name}(${params(m.params)});`
     case 'ifaceProp': {
@@ -218,13 +239,16 @@ export function decl(d: Decl, depth: number): string {
     case 'struct':
     case 'interface': {
       const kw = d.kind === 'class' ? '类' : d.kind === 'struct' ? '结构' : '接口'
-      const tparams = d.typeParams === undefined || d.typeParams.length === 0 ? '' : `<${d.typeParams.join(', ')}>`
+      const tparams = d.typeParams === undefined || d.typeParams.length === 0
+        ? ''
+        : `<${d.typeParams.map((p) => { const cs = d.typeConstraints?.[p]; return cs === undefined ? p : `${p}: ${cs.map(typeRef).join(' & ')}` }).join(', ')}>`
       const bases = d.bases.length > 0 ? ' : ' + d.bases.map(typeRef).join(', ') : ''
+      const nl = braceStyle === 'next' ? '\n' + p : ' '
       if (d.members.length === 0) {
-        return `${p}${modifiers(d.modifiers)}${kw} ${d.name}${tparams}${bases} { }`
+        return `${p}${modifiers(d.modifiers)}${kw} ${d.name}${tparams}${bases}${nl}{ }`
       }
       const body = d.members.map((m) => member(m, depth + 1)).join('\n')
-      return `${p}${modifiers(d.modifiers)}${kw} ${d.name}${tparams}${bases} {\n${body}\n${p}}`
+      return `${p}${modifiers(d.modifiers)}${kw} ${d.name}${tparams}${bases}${nl}{\n${body}\n${p}}`
     }
     case 'enum': {
       const items = d.items.map((i) => (i.value === null ? i.name : `${i.name} = ${expr(i.value)}`))
@@ -234,12 +258,14 @@ export function decl(d: Decl, depth: number): string {
       return `${p}${modifiers(d.modifiers)}委托 ${d.name}(${params(d.params)}): ${typeRef(d.ret)};`
     case 'namespace': {
       const body = d.decls.map((x) => decl(x, depth + 1)).join('\n\n')
-      return `${p}空间 ${d.name} {\n${body}\n${p}}`
+      return `${p}命名空间 ${d.name} {\n${body}\n${p}}`
     }
   }
 }
 
-export function printUnit(u: CompilationUnit): string {
+export function printUnit(u: CompilationUnit, options?: { indent?: string; braceStyle?: 'same' | 'next' }): string {
+  indentUnit = options?.indent ?? '    '
+  braceStyle = options?.braceStyle === 'next' ? 'next' : 'same'
   const parts: string[] = []
   if (u.usings.length > 0) {
     parts.push(u.usings.map((x) => `引 ${x};`).join('\n'))

@@ -47,11 +47,15 @@ export function formatDiagnostic(d: Diagnostic, source: string): string {
   return out
 }
 
-export function formatAll(diags: Diagnostic[], source: string): string {
+export function formatAll(diags: Diagnostic[], source: string, sourceForFile?: (file: string) => string): string {
   if (diags.length === 0) return ''
   const errors = diags.filter((d) => d.severity === 'error').length
   const warns = diags.length - errors
-  const body = diags.map((d) => formatDiagnostic(d, source)).join('\n')
+  const body = diags.map((d) => {
+    const file = d.filePath ?? d.file
+    const text = file !== undefined && sourceForFile !== undefined ? sourceForFile(file) : source
+    return formatDiagnostic(d, text)
+  }).join('\n')
   const summary = errors > 0
     ? `共 ${errors} 个错误${warns > 0 ? `，${warns} 个提示` : ''}。`
     : `共 ${warns} 个提示，没有错误。`

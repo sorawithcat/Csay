@@ -33,16 +33,38 @@ function cloneType(t: TypeRef): TypeRef {
 
 export function expandGenerics(unit: CompilationUnit): CompilationUnit {
   const templates = new Map<string, GenericDecl>()
-  const collect = (decls: Decl[]): void => {
+  const collect = (decls: Decl[], path: string[] = []): void => {
     for (const d of decls) {
-      if (d.kind === 'namespace') collect(d.decls)
+      if (d.kind === 'namespace') collect(d.decls, [...path, ...d.name.split('.')])
       else if ((d.kind === 'class' || d.kind === 'struct' || d.kind === 'interface') && (d.typeParams?.length ?? 0) > 0) {
         templates.set(d.name, d)
+        if (path.length > 0) templates.set([...path, d.name].join('.'), d)
       }
     }
   }
   collect(unit.decls)
   if (templates.size === 0) return unit
+
+  const baseNames = new Map<string, string[]>()
+  const collectBases = (decls: Decl[]): void => {
+    for (const d of decls) {
+      if (d.kind === 'namespace') collectBases(d.decls)
+      else if (d.kind === 'class' || d.kind === 'struct' || d.kind === 'interface') {
+        baseNames.set(d.name, d.bases.map((b) => b.name))
+      }
+    }
+  }
+  collectBases(unit.decls)
+
+  function satisfies(actual: TypeRef, constraint: TypeRef, seen: Set<string> = new Set()): boolean {
+    if (typeKey(actual) === typeKey(constraint)) return true
+    if (actual.kind !== 'named' || constraint.kind !== 'named') return false
+    if (seen.has(actual.name)) return false
+    seen.add(actual.name)
+    const bases = baseNames.get(actual.name)
+    if (bases === undefined) return false
+    return bases.some((b) => b === constraint.name || satisfies(named(b, actual.line, actual.col), constraint, seen))
+  }
 
   const made = new Map<string, GenericDecl>()
   const order: GenericDecl[] = []
@@ -60,12 +82,19 @@ export function expandGenerics(unit: CompilationUnit): CompilationUnit {
       if (args.length !== (tpl.typeParams?.length ?? 0)) {
         throw new Error(`泛型「${t.name}」需要 ${tpl.typeParams?.length ?? 0} 个类型参数`)
       }
-      const key = `${t.name}<${args.map(typeKey).join(',')}>`
+      ;(tpl.typeParams ?? []).forEach((p, i) => {
+        for (const constraint of tpl.typeConstraints?.[p] ?? []) {
+          if (!satisfies(args[i], constraint)) {
+            throw new Error(`类型实参「${typeKey(args[i])}」不满足泛型参数「${p}」的约束「${typeKey(constraint)}」`)
+          }
+        }
+      })
+      const key = `${tpl.name}<${args.map(typeKey).join(',')}>`
       let decl = made.get(key)
       if (decl === undefined) {
-        let name = `${t.name}_${args.map(mangle).join('_')}`
+        let name = `${tpl.name}_${args.map(mangle).join('_')}`
         let n = 2
-        while (usedNames.has(name)) name = `${t.name}_${args.map(mangle).join('_')}_${n++}`
+        while (usedNames.has(name)) name = `${tpl.name}_${args.map(mangle).join('_')}_${n++}`
         usedNames.add(name)
         decl = structuredClone(tpl) as GenericDecl
         made.set(key, decl)
@@ -83,6 +112,7 @@ export function expandGenerics(unit: CompilationUnit): CompilationUnit {
     env.set(tpl.name, named(name, tpl.line, tpl.col))
     decl.name = name
     decl.typeParams = []
+    decl.typeConstraints = undefined
     decl.bases = decl.bases.map((b) => rewriteType(b, env))
     for (const m of decl.members) {
       if (m.kind === 'ctor' && m.name === tpl.name) m.name = name
@@ -205,6 +235,10 @@ export function expandGenerics(unit: CompilationUnit): CompilationUnit {
         return d
       case 'enum':
         for (const it of d.items) if (it.value !== null) rewriteExpr(it.value, new Map())
+        return d
+      case 'delegate':
+        d.ret = rewriteType(d.ret)
+        for (const p of d.params) p.type = rewriteType(p.type)
         return d
     }
   }
